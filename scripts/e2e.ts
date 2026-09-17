@@ -148,8 +148,10 @@ async function main() {
     log('deposit tx', depSig, 'size', depositTx.serialize().length, 'bytes');
     await new Promise((r) => setTimeout(r, 2500));
     await A.sync(mint);
-    log('alice shielded balance', A.balance(mint) / unit, '| public', (await tokenBalance(mint, tokenProgram, alice.publicKey)) / unit);
-    if (A.balance(mint) !== 1000n * unit) throw new Error('deposit not credited');
+    // the amount given is what leaves the wallet; a transfer-fee mint credits amount minus its own fee (990 here)
+    const credited = (await A.depositPreview(mint, 1000n * unit)).credited;
+    log('alice shielded balance', A.balance(mint) / unit, '| public', (await tokenBalance(mint, tokenProgram, alice.publicKey)) / unit, '| expected', credited / unit);
+    if (A.balance(mint) !== credited) throw new Error('deposit not credited');
 
     // 3. alice pays bob 250 privately
     const sendSig = await A.send(mint, 250n * unit, B.shieldedAddress(), (p) => log('  ', p.step, p.detail ?? p.signature ?? ''));
@@ -160,7 +162,7 @@ async function main() {
     const sendFee = await A.sendFee(mint, 250n * unit);
     log('alice shielded', A.balance(mint) / unit, '| bob shielded', B.balance(mint) / unit, '| fee', sendFee);
     if (B.balance(mint) !== 250n * unit) throw new Error('bob did not receive');
-    if (A.balance(mint) !== 1000n * unit - 250n * unit - sendFee) throw new Error('alice change wrong');
+    if (A.balance(mint) !== credited - 250n * unit - sendFee) throw new Error('alice change wrong');
 
     // 4. bob withdraws 100 to a fresh wallet (relayer pays gas + creates the token account)
     const wSig = await B.withdraw(mint, 100n * unit, fresh.publicKey, (p) => log('  ', p.step, p.detail ?? p.signature ?? ''));

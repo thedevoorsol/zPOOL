@@ -1,7 +1,7 @@
 /**
  * High-level client: unlock, sync notes, deposit (wallet signs), withdraw / send (relayer signs).
  */
-import { TOKEN_2022_PROGRAM_ID } from '@solana/spl-token';
+import { TOKEN_2022_PROGRAM_ID, calculateEpochFee, getTransferFeeConfig, unpackMint, type TransferFeeConfig } from '@solana/spl-token';
 import { AddressLookupTableAccount, Connection, PublicKey, TransactionMessage, VersionedTransaction } from '@solana/web3.js';
 import type { Program } from '@coral-xyz/anchor';
 import { FIELD_SIZE_BIG, bytesToHex, hexToBytes, poseidonReady } from './crypto';
@@ -27,6 +27,7 @@ export class ShieldPool {
   private notes = new Map<string, OwnedNote[]>();
   private scanned = new Map<string, number>();
   private cfg: RelayerConfig | null = null;
+  private transferFees = new Map<string, { at: number; cfg: TransferFeeConfig | null; epoch: bigint }>();
 
   constructor(opts: { connection: Connection; relayerUrl: string; artifacts: Artifacts; programId?: PublicKey }) {
     this.connection = opts.connection;
@@ -190,40 +191,103 @@ export class ShieldPool {
     throw new Error('balance is split across several notes; consolidate first');
   }
 
+  // ---------- token transfer fees (Token-2022) ----------
+  /** The mint's own transfer fee on `amount` (0 for SPL and fee-less mints). Cached for a minute. */
+  async tokenTransferFee(mint: PublicKey, amount: bigint): Promise<bigint> {
+    if (mint.equals(SOL_MINT) || amount <= 0n) return 0n;
+    const key = mint.toBase58();
+    let entry = this.transferFees.get(key);
+    if (!entry || Date.now() - entry.at > 60_000) {
+      const info = await this.connection.getAccountInfo(mint);
+      if (!info) throw new Error(`mint ${key} not found`);
+      let cfg: TransferFeeConfig | null = null;
+      if (info.owner.equals(TOKEN_2022_PROGRAM_ID)) cfg = getTransferFeeConfig(unpackMint(mint, info, TOKEN_2022_PROGRAM_ID));
+      const epoch = cfg ? BigInt((await this.connection.getEpochInfo()).epoch) : 0n;
+      entry = { at: Date.now(), cfg, epoch };
+      this.transferFees.set(key, entry);
+    }
+    return entry.cfg ? calculateEpochFee(entry.cfg, entry.epoch, amount) : 0n;
+  }
+  async transferFeeBps(mint: PublicKey): Promise<number> {
+    await this.tokenTransferFee(mint, 1n);
+    const e = this.transferFees.get(mint.toBase58());
+    if (!e?.cfg) return 0;
+    const f = e.epoch >= BigInt(e.cfg.newerTransferFee.epoch) ? e.cfg.newerTransferFee : e.cfg.olderTransferFee;
+    return f.transferFeeBasisPoints;
+  }
+
   // ---------- fees ----------
   /** Protocol fee taken out of a deposit: the note you receive is amount minus this. */
   async depositFee(amount: bigint): Promise<bigint> {
     const cfg = await this.config();
     return (amount * BigInt(cfg.depositFeeBps ?? 0)) / 10000n;
   }
+  /**
+   * What happens to `amount` (raw units) taken from the wallet: the mint's own transfer fee comes off first
+   * (Token-2022), then the protocol fee; `credited` is the shielded note you end up with.
+   * Entering your full balance therefore always works: nothing is grossed up.
+   */
+  async depositPreview(mint: PublicKey, amount: bigint): Promise<{ tokenFee: bigint; net: bigint; protocolFee: bigint; credited: bigint }> {
+    const tokenFee = await this.tokenTransferFee(mint, amount);
+    let net = amount - tokenFee;
+    // the program re-derives the gross from `net`; make sure that gross never exceeds what the wallet sends
+    const e = this.transferFees.get(mint.toBase58());
+    if (e?.cfg && net > 0n) {
+      const f = e.epoch >= BigInt(e.cfg.newerTransferFee.epoch) ? e.cfg.newerTransferFee : e.cfg.olderTransferFee;
+      const bps = BigInt(f.transferFeeBasisPoints);
+      const maxFee = f.maximumFee;
+      const preFee = (n: bigint) => {
+        if (bps === 0n) return n;
+        const raw = (n * 10000n + (10000n - bps) - 1n) / (10000n - bps);
+        return raw - n >= maxFee ? n + maxFee : raw;
+      };
+      while (net > 0n && preFee(net) > amount) net -= 1n;
+    }
+    const protocolFee = await this.depositFee(net);
+    return { tokenFee, net, protocolFee, credited: net - protocolFee };
+  }
   async withdrawFee(mint: PublicKey, amount: bigint): Promise<bigint> {
     const cfg = await this.config();
     const pool = await this.requirePool(mint);
+    if (pool.priced === false) throw new Error(`${pool.symbol} has no market price yet, so the relayer cannot cover gas for it`);
     let fee = (amount * BigInt(cfg.withdrawFeeBps)) / 10000n;
     if (mint.equals(SOL_MINT)) fee += BigInt(cfg.solFlatLamports);
-    if (fee < BigInt(pool.minFee)) fee = BigInt(pool.minFee);
+    const floor = BigInt(pool.withdrawMinFee ?? pool.minFee);
+    if (fee < floor) fee = floor;
     return fee;
   }
-  async sendFee(mint: PublicKey, amount: bigint): Promise<bigint> {
-    const cfg = await this.config();
+  /** What the recipient wallet ends up with after the protocol fee and the mint's own transfer fee. */
+  async withdrawPreview(mint: PublicKey, amount: bigint): Promise<{ protocolFee: bigint; tokenFee: bigint; received: bigint }> {
+    const protocolFee = await this.withdrawFee(mint, amount);
+    const tokenFee = await this.tokenTransferFee(mint, amount);
+    return { protocolFee, tokenFee, received: amount - tokenFee };
+  }
+  /**
+   * Flat relayer fee for a private send. It is the same for everyone in the pool at a given time and does not
+   * depend on the amount, so the on-chain fee transfer reveals nothing about what was sent.
+   */
+  async sendFee(mint: PublicKey, _amount?: bigint): Promise<bigint> {
     const pool = await this.requirePool(mint);
-    let fee = (amount * BigInt(cfg.sendFeeBps)) / 10000n;
-    if (fee < BigInt(pool.minFee)) fee = BigInt(pool.minFee);
-    return fee;
+    if (pool.priced === false) throw new Error(`${pool.symbol} has no market price yet, so the relayer cannot cover gas for it`);
+    return BigInt(pool.sendFee ?? pool.minFee);
   }
 
   // ---------- operations ----------
   /**
    * Deposit: returns a transaction for the wallet to sign and send. Wallet pays gas.
+   * `amount` is what leaves the wallet. For a Token-2022 mint with a transfer fee the vault receives
+   * amount minus that fee, and that net figure is what the proof commits to (so shielding a full balance works).
    * SPL deposits use the pool's lookup table (v0); SOL deposits are legacy.
    */
-  async buildDepositTx(mint: PublicKey, amount: bigint, signer: PublicKey, onProgress?: ProgressCb): Promise<VersionedTransaction> {
+  async buildDepositTx(mint: PublicKey, walletAmount: bigint, signer: PublicKey, onProgress?: ProgressCb): Promise<VersionedTransaction> {
     if (!this.keys) throw new Error('locked');
     const cfg = await this.config();
     const pool = await this.requirePool(mint);
     const feeRecipient = new PublicKey(cfg.feeRecipient);
     onProgress?.({ step: 'proving', detail: 'generating zero-knowledge proof' });
-    const depositFee = await this.depositFee(amount);
+    const preview = await this.depositPreview(mint, walletAmount);
+    const amount = preview.net;
+    const depositFee = preview.protocolFee;
     if (amount <= depositFee) throw new Error('amount too small to cover the fee');
     const out = newUtxo({ amount: amount - depositFee, pubkey: this.keys.utxoPubkey, privkey: this.keys.utxoPrivkey, mint });
     const change = newUtxo({ amount: 0n, pubkey: this.keys.utxoPubkey, privkey: this.keys.utxoPrivkey, mint });

@@ -53,6 +53,7 @@ import { IDL, PROGRAM_ID, ata, computeBudgetIx, fetchGlobalConfig, getProgram, n
 import type { OnchainProof } from '../../sdk/src/prover';
 import { SOL_MINT } from '../../sdk/src/utxo';
 import { Db, type PoolRow } from './db.ts';
+import { flatFeeInToken, imageFromUri, refreshPrices, searchTokens, tokensByMint, usdPrice } from './tokens.ts';
 
 const RPC_URL = process.env.RPC_URL ?? 'http://127.0.0.1:8899';
 const PORT = Number(process.env.PORT ?? 8787);
@@ -71,8 +72,17 @@ const DB_PATH = (() => {
 })();
 const CHAIN = process.env.CHAIN ?? 'solana:localnet';
 const WITHDRAW_FEE_BPS = Number(process.env.WITHDRAW_FEE_BPS ?? 30);
-const SEND_FEE_BPS = Number(process.env.SEND_FEE_BPS ?? 30);
 const SOL_FLAT_LAMPORTS = BigInt(process.env.SOL_FLAT_LAMPORTS ?? 2_000_000);
+/**
+ * Relayer-paid operations charge a FLAT fee worth this much SOL, converted into the pool's token at market price.
+ * A percentage fee on a private send would leak the amount (fee / rate = amount); a flat fee says nothing.
+ * Withdrawals keep the on-chain percentage but never go below the flat amount, so tiny withdrawals cannot drain gas.
+ */
+const SEND_FLAT_SOL = Number(process.env.SEND_FLAT_SOL ?? 0.002);
+const WITHDRAW_FLAT_SOL = Number(process.env.WITHDRAW_FLAT_SOL ?? 0.003);
+/** On mainnet a token without a market price gets no gasless service (it would be a free way to drain the relayer). */
+const REQUIRE_PRICE = (process.env.REQUIRE_PRICE ?? (process.env.CHAIN?.endsWith('mainnet') ? '1' : '0')) === '1';
+const MAX_BODY = 256 * 1024;
 const POLL_MS = Number(process.env.POLL_MS ?? 1500);
 /** 1 = 4,096-byte transaction v1 (default, live on mainnet since epoch 1035); 0 = v0 + lookup table fallback */
 const RELAY_TX_VERSION = Number(process.env.RELAY_TX_VERSION ?? 1);
@@ -111,6 +121,13 @@ async function tokenMeta(mint: PublicKey, tokenProgram: PublicKey): Promise<{ sy
   let symbol = mint.toBase58().slice(0, 4);
   let name = mint.toBase58();
   let logoUri: string | null = null;
+  // Jupiter knows most traded tokens and serves a real image, not a metadata JSON.
+  try {
+    const j = (await tokensByMint([mint.toBase58()])).get(mint.toBase58());
+    if (j && j.decimals === m.decimals) return { symbol: j.symbol || symbol, name: j.name || name, logoUri: j.logoUri, decimals: m.decimals };
+  } catch {
+    /* fall through to on-chain metadata */
+  }
   try {
     if (tokenProgram.equals(TOKEN_2022_PROGRAM_ID)) {
       const md = await getTokenMetadata(connection, mint, 'confirmed', tokenProgram);
@@ -140,7 +157,45 @@ async function tokenMeta(mint: PublicKey, tokenProgram: PublicKey): Promise<{ sy
   } catch {
     /* metadata is optional */
   }
-  return { symbol, name, logoUri, decimals: m.decimals };
+  return { symbol, name, logoUri: await imageFromUri(logoUri), decimals: m.decimals };
+}
+
+/** Pools registered before icons were resolved may hold a metadata JSON url or nothing: fix them once. */
+async function refreshLogos(): Promise<void> {
+  for (const p of db.pools()) {
+    const looksLikeImage = p.logo_uri && /\.(png|jpe?g|webp|gif|svg)(\?|$)/i.test(p.logo_uri);
+    if (looksLikeImage) continue;
+    try {
+      const meta = p.mint === SOL_MINT.toBase58()
+        ? { symbol: 'SOL', name: 'Solana', logoUri: (await tokensByMint([p.mint])).get(p.mint)?.logoUri ?? null, decimals: 9 }
+        : await tokenMeta(new PublicKey(p.mint), new PublicKey(p.token_program));
+      if (meta.logoUri && meta.logoUri !== p.logo_uri) {
+        db.upsertPool({ ...p, symbol: meta.symbol, name: meta.name, logo_uri: meta.logoUri });
+        log('logo resolved', meta.symbol, meta.logoUri);
+      }
+    } catch (e) {
+      log('logo refresh failed', p.symbol, (e as Error).message);
+    }
+  }
+}
+
+async function priceLoop(): Promise<void> {
+  for (;;) {
+    try {
+      await refreshPrices(db.pools().map((p) => p.mint));
+    } catch (e) {
+      log('price refresh failed', (e as Error).message);
+    }
+    await new Promise((r) => setTimeout(r, 5 * 60_000));
+  }
+}
+
+let gcCache: { at: number; value: Awaited<ReturnType<typeof fetchGlobalConfig>> } | null = null;
+async function globalConfig(): Promise<Awaited<ReturnType<typeof fetchGlobalConfig>>> {
+  if (gcCache && Date.now() - gcCache.at < 30_000) return gcCache.value;
+  const value = await fetchGlobalConfig(program);
+  gcCache = { at: Date.now(), value };
+  return value;
 }
 
 async function ensureSolPool(): Promise<void> {
@@ -399,17 +454,28 @@ async function indexerLoop(): Promise<void> {
 type RelayBody = { kind: 'withdraw' | 'send'; mint: string; proof: OnchainProof; extAmount: string; fee: string; recipient: string; encryptedOutput1: string; encryptedOutput2: string };
 
 let onchainWithdrawBps = WITHDRAW_FEE_BPS;
+/** Flat fees quoted for a pool right now, raw token units. null = token has no market price. */
+function flatFees(pool: PoolRow): { send: bigint | null; withdraw: bigint | null } {
+  if (pool.mint === SOL_MINT.toBase58()) return { send: BigInt(Math.round(SEND_FLAT_SOL * 1e9)), withdraw: SOL_FLAT_LAMPORTS };
+  return { send: flatFeeInToken(pool.mint, pool.decimals, SEND_FLAT_SOL), withdraw: flatFeeInToken(pool.mint, pool.decimals, WITHDRAW_FLAT_SOL) };
+}
 function minFee(kind: 'withdraw' | 'send', pool: PoolRow, amountAbs: bigint): bigint {
-  const bps = kind === 'withdraw' ? onchainWithdrawBps : SEND_FEE_BPS;
-  let fee = (amountAbs * BigInt(bps)) / 10000n;
-  if (pool.mint === SOL_MINT.toBase58() && kind === 'withdraw') fee += SOL_FLAT_LAMPORTS;
-  if (fee < BigInt(pool.min_fee)) fee = BigInt(pool.min_fee);
+  const flat = flatFees(pool)[kind];
+  if (flat === null && REQUIRE_PRICE) throw new Error(`${pool.symbol} has no market price yet, so the relayer cannot quote a fee for it`);
+  if (kind === 'send') {
+    // flat only: the fee must not depend on the amount, or it would reveal it
+    return ((flat ?? 0n) * 80n) / 100n; // 20% tolerance for a price refresh between quote and relay
+  }
+  let fee = (amountAbs * BigInt(onchainWithdrawBps)) / 10000n;
+  if (pool.mint === SOL_MINT.toBase58()) fee += SOL_FLAT_LAMPORTS;
   // tolerate the on-chain 5% error margin so rounding never rejects
-  return (fee * 95n) / 100n;
+  fee = (fee * 95n) / 100n;
+  const floor = ((flat ?? BigInt(pool.min_fee)) * 80n) / 100n;
+  return fee > floor ? fee : floor;
 }
 
 async function relay(body: RelayBody): Promise<string> {
-  const gcNow = await fetchGlobalConfig(program);
+  const gcNow = await globalConfig();
   if (gcNow) onchainWithdrawBps = gcNow.withdrawalFeeRate;
   const pool = db.pool(body.mint);
   if (!pool) throw new Error('unknown pool');
@@ -419,14 +485,14 @@ async function relay(body: RelayBody): Promise<string> {
   if (body.kind === 'withdraw' && extAmount >= 0n) throw new Error('withdraw needs a negative extAmount');
   if (body.kind === 'send' && extAmount !== 0n) throw new Error('send needs extAmount 0');
   const amountAbs = extAmount < 0n ? -extAmount : 0n;
-  const required = body.kind === 'withdraw' ? minFee('withdraw', pool, amountAbs) : minFee('send', pool, fee);
+  const required = minFee(body.kind, pool, amountAbs);
   if (fee < required) throw new Error(`fee too low: need at least ${required}`);
 
   const n = nullifierAccounts(body.proof);
   const infos = await connection.getMultipleAccountsInfo([n.nullifier0, n.nullifier1, n.nullifier2, n.nullifier3]);
   if (infos.some((i) => i)) throw new Error('note already spent');
 
-  const gc = await fetchGlobalConfig(program);
+  const gc = await globalConfig();
   if (!gc) throw new Error('program not initialized');
   const recipient = new PublicKey(body.recipient);
   const enc1 = Uint8Array.from(Buffer.from(body.encryptedOutput1, 'base64'));
@@ -490,7 +556,12 @@ async function relayerTokenAccount(mint: PublicKey, tokenProgram: PublicKey): Pr
 
 // ---------------------------------------------------------------- http
 function poolJson(p: PoolRow) {
+  const flat = flatFees(p);
   return {
+    sendFee: (flat.send ?? 0n).toString(),
+    withdrawMinFee: (flat.withdraw ?? BigInt(p.min_fee)).toString(),
+    usdPrice: usdPrice(p.mint),
+    priced: flat.send !== null || !REQUIRE_PRICE,
     mint: p.mint,
     tokenProgram: p.token_program,
     decimals: p.decimals,
@@ -508,24 +579,83 @@ function poolJson(p: PoolRow) {
 
 async function readJson(req: http.IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
-  for await (const c of req) chunks.push(c as Buffer);
+  let size = 0;
+  for await (const c of req) {
+    size += (c as Buffer).length;
+    if (size > MAX_BODY) throw Object.assign(new Error('body too large'), { status: 413 });
+    chunks.push(c as Buffer);
+  }
   return chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {};
 }
 
-async function route(req: http.IncomingMessage, url: URL): Promise<unknown> {
+// ---------------------------------------------------------------- rate limiting (per client IP, token bucket)
+type Bucket = { tokens: number; at: number };
+const buckets = new Map<string, Bucket>();
+const LIMITS: Record<string, { perSec: number; burst: number }> = {
+  '/rpc': { perSec: 15, burst: 60 },
+  '/relay': { perSec: 0.2, burst: 6 },
+  '/tokens/search': { perSec: 3, burst: 15 },
+  '*': { perSec: 30, burst: 120 },
+};
+function allow(ip: string, path: string): boolean {
+  const key = path === '/rpc' || path === '/relay' || path === '/tokens/search' ? path : '*';
+  const lim = LIMITS[key];
+  const id = `${key}|${ip}`;
+  const now = Date.now();
+  let b = buckets.get(id);
+  if (!b) buckets.set(id, (b = { tokens: lim.burst, at: now }));
+  b.tokens = Math.min(lim.burst, b.tokens + ((now - b.at) / 1000) * lim.perSec);
+  b.at = now;
+  if (b.tokens < 1) return false;
+  b.tokens -= 1;
+  return true;
+}
+setInterval(() => {
+  const cutoff = Date.now() - 10 * 60_000;
+  for (const [k, b] of buckets) if (b.at < cutoff) buckets.delete(k);
+}, 60_000).unref();
+function clientIp(req: http.IncomingMessage): string {
+  // The hosting edge appends the real client address LAST; anything before it may be supplied by the client
+  // (verified against Railway: trusting the first entry let spoofed headers dodge the limiter).
+  const xf = req.headers['x-forwarded-for'];
+  const parts = (Array.isArray(xf) ? xf.join(',') : xf ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+  return parts[parts.length - 1] || req.socket.remoteAddress || 'unknown';
+}
+
+async function route(req: http.IncomingMessage, url: URL, res: http.ServerResponse): Promise<unknown> {
   const p = url.pathname;
   if (req.method === 'GET' && p === '/config') {
-    const gc = await fetchGlobalConfig(program);
+    const gc = await globalConfig();
+    res.setHeader('cache-control', 'public, max-age=30');
     return {
       programId: PROGRAM_ID.toBase58(),
       relayer: relayer.publicKey.toBase58(),
       feeRecipient: gc?.feeRecipient.toBase58() ?? relayer.publicKey.toBase58(),
       depositFeeBps: gc?.depositFeeRate ?? 0,
       withdrawFeeBps: gc?.withdrawalFeeRate ?? WITHDRAW_FEE_BPS,
-      sendFeeBps: SEND_FEE_BPS,
+      /** private sends charge a flat fee per pool (see /pools sendFee), never a percentage */
+      sendFeeBps: 0,
+      sendFlatSol: SEND_FLAT_SOL,
+      withdrawFlatSol: WITHDRAW_FLAT_SOL,
       solFlatLamports: SOL_FLAT_LAMPORTS.toString(),
       chain: CHAIN,
     };
+  }
+  if (req.method === 'GET' && p === '/tokens/search') {
+    const q = (url.searchParams.get('q') ?? '').trim().slice(0, 64);
+    if (!q) return [];
+    res.setHeader('cache-control', 'public, max-age=60');
+    const list = await searchTokens(q);
+    return list.slice(0, 25).map((t) => ({ ...t, hasPool: !!db.pool(t.mint) }));
+  }
+  if (req.method === 'GET' && p === '/tokens/meta') {
+    const mints = (url.searchParams.get('mints') ?? '').split(',').map((m) => m.trim()).filter(Boolean).slice(0, 100);
+    res.setHeader('cache-control', 'public, max-age=300');
+    const found = await tokensByMint(mints);
+    return mints.map((m) => {
+      const t = found.get(m);
+      return t ? { ...t, hasPool: !!db.pool(m) } : null;
+    });
   }
   if (req.method === 'GET' && p === '/pools') return db.pools().map(poolJson);
   if (req.method === 'GET' && p.startsWith('/pools/')) {
@@ -550,6 +680,8 @@ async function route(req: http.IncomingMessage, url: URL): Promise<unknown> {
     const mint = url.searchParams.get('mint')!;
     const start = Number(url.searchParams.get('start') ?? 0);
     const rows = db.leaves(mint, start, 5000);
+    // a full page never changes (leaves are append-only): let browsers and the CDN keep it
+    res.setHeader('cache-control', rows.length === 5000 ? 'public, max-age=86400, immutable' : 'no-store');
     return { utxos: rows.map((r) => ({ index: r.idx, commitment: r.commitment, encryptedOutput: r.encrypted, signature: r.signature })), nextIndex: rows.length ? rows[rows.length - 1].idx + 1 : start, root: tree(mint).root() };
   }
   if (req.method === 'POST' && p === '/nullifiers') {
@@ -608,8 +740,13 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   const url = new URL(req.url ?? '/', 'http://localhost');
+  if (!allow(clientIp(req), url.pathname)) {
+    res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '2' });
+    res.end(JSON.stringify({ error: 'too many requests' }));
+    return;
+  }
   try {
-    const out = await route(req, url);
+    const out = await route(req, url, res);
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify(out ?? null));
   } catch (e) {
@@ -627,7 +764,10 @@ const server = http.createServer(async (req, res) => {
   await ensureSolPool();
   for (const p of db.pools()) tree(p.mint);
   await poll();
+  await refreshPrices(db.pools().map((p) => p.mint)).catch((e) => log('price refresh failed', e.message));
   await syncFeeRecipient().catch((e) => log('fee recipient sync failed', e.message));
+  void refreshLogos();
+  void priceLoop();
   setInterval(() => syncFeeRecipient().catch((e) => log('fee recipient sync failed', e.message)), 60_000);
   server.listen(PORT, () => log(`listening on :${PORT}`));
   void indexerLoop();

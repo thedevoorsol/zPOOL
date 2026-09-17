@@ -55,11 +55,17 @@ number of people using a pool.
 
 Set on chain in the program's global config and readable at the relayer's `/config`:
 
-- shield: 0.5% of the amount, deducted from the deposit
-- unshield: 0.5% of the amount (+0.002 SOL on SOL pools, which covers the relayer's rent for nullifier accounts)
-- private payment: 0.3%
+- shield: 0.5% of the amount, deducted from the deposit. For a Token-2022 mint with its own transfer fee, that
+  fee comes off first: the amount you enter is what leaves your wallet, so shielding a full balance always works.
+- unshield: 0.5% of the amount, with a floor worth about 0.003 SOL in the token (the relayer's gas plus the rent of
+  the recipient's token account and the two nullifier accounts). SOL pools pay 0.5% + 0.002 SOL.
+- private payment: a **flat** fee worth about 0.002 SOL, paid in the pool's token at market price and identical for
+  every send in that pool at a given time. It is flat on purpose: a percentage fee on a private send would be
+  visible on chain and would give the amount away (fee / rate = amount). A flat fee says nothing about the amount.
 
-The fee recipient is enforced by the program, not by the relayer, so it cannot be bypassed by self-relaying.
+The relayer prices tokens through Jupiter and refuses to relay for a token it cannot price (a token with no market
+would otherwise be a free way to drain its gas). Shielding is always possible; only the gasless operations need a
+price. The fee recipient is enforced by the program, not by the relayer, so it cannot be bypassed by self-relaying.
 
 ## Repository
 
