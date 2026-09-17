@@ -1,6 +1,6 @@
 <p align="center"><b>zPOOL</b></p>
 <p align="center">A shielded pool for any Solana token.<br/>Hold and pay privately. Withdraw anywhere. No whitelist, no auditor key.</p>
-<p align="center"><a href="https://zpool.vercel.app">zpool.vercel.app</a></p>
+<p align="center"><a href="https://www.zpool.fun">www.zpool.fun</a></p>
 
 ---
 
@@ -17,7 +17,7 @@ It works for every SPL and Token-2022 mint. If a coin has no pool yet, anyone op
 |---|---|
 | Program (mainnet) | `7Bts9gjMRYG577hbipnAZMuEiBWnGy4SwkqN8TjRpuVF` |
 | Verified build hash | `435fb7ad7b31f1b7d3981dbfc8924247259bcfc8d2cf1f3510b4ca163992f444` |
-| App | https://zpool.vercel.app |
+| App | https://www.zpool.fun |
 | Design | Tornado Nova style joinsplit, Groth16 on BN254, Poseidon Merkle tree of height 26 |
 | Lineage | Fork of [Privacy Cash](https://github.com/Privacy-Cash/privacy-cash), circuits and trusted setup unchanged |
 
