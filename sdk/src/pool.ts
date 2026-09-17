@@ -185,10 +185,48 @@ export class ShieldPool {
   private selectInputs(mint: PublicKey, needed: bigint): OwnedNote[] {
     const notes = this.unspent(mint);
     const total = notes.reduce((s, n) => s + n.amount, 0n);
-    if (total < needed) throw new Error('insufficient shielded balance');
+    if (total < needed) throw new Error('amount plus fee exceeds your shielded balance');
     if (notes.length && notes[0].amount >= needed) return [notes[0]];
     if (notes.length >= 2 && notes[0].amount + notes[1].amount >= needed) return [notes[0], notes[1]];
-    throw new Error('balance is split across several notes; consolidate first');
+    throw Object.assign(new Error('balance is split across several notes'), { fragmented: true });
+  }
+
+  /**
+   * The most that one send / withdrawal can move right now, after the fee, from the two largest notes
+   * (a proof spends at most two). `fragmented` = more value exists in smaller notes; send()/withdraw() merge
+   * notes automatically when the amount needs them, one flat fee per merge.
+   */
+  async spendable(mint: PublicKey, kind: 'send' | 'withdraw'): Promise<{ max: bigint; fee: bigint; fragmented: boolean; notes: number }> {
+    const notes = this.unspent(mint);
+    const top = notes.slice(0, 2).reduce((s, n) => s + n.amount, 0n);
+    const total = notes.reduce((s, n) => s + n.amount, 0n);
+    let fee = kind === 'send' ? await this.sendFee(mint) : 0n;
+    let max = top - fee;
+    if (kind === 'withdraw') {
+      // the withdrawal fee depends on the amount: iterate to a fixed point
+      for (let i = 0; i < 4 && max > 0n; i++) {
+        fee = await this.withdrawFee(mint, max);
+        max = top - fee;
+      }
+    }
+    if (max < 0n) max = 0n;
+    return { max, fee, fragmented: total > top, notes: notes.length };
+  }
+
+  /** Pick inputs; if the balance is spread over more than two notes, merge notes until two of them cover `needed`. */
+  private async selectInputsMerging(mint: PublicKey, needed: bigint, onProgress?: ProgressCb): Promise<OwnedNote[]> {
+    for (let round = 0; round < 6; round++) {
+      try {
+        return this.selectInputs(mint, needed);
+      } catch (e) {
+        if (!(e as { fragmented?: boolean }).fragmented) throw e;
+        onProgress?.({ step: 'merging notes', detail: `your balance is in ${this.unspent(mint).length} notes; merging two (one flat fee)` });
+        await this.consolidate(mint);
+        await new Promise((r) => setTimeout(r, 1500));
+        await this.sync(mint);
+      }
+    }
+    throw new Error('could not gather enough notes; try a smaller amount');
   }
 
   // ---------- token transfer fees (Token-2022) ----------
@@ -346,7 +384,7 @@ export class ShieldPool {
     const cfg = await this.config();
     const fee = await this.withdrawFee(mint, amount);
     await this.sync(mint);
-    const inputs = this.selectInputs(mint, amount + fee);
+    const inputs = await this.selectInputsMerging(mint, amount + fee, onProgress);
     const inSum = inputs.reduce((s, n) => s + n.amount, 0n);
     const change = newUtxo({ amount: inSum - amount - fee, pubkey: this.keys.utxoPubkey, privkey: this.keys.utxoPrivkey, mint });
     const dummy = newUtxo({ amount: 0n, pubkey: this.keys.utxoPubkey, privkey: this.keys.utxoPrivkey, mint });
@@ -384,7 +422,7 @@ export class ShieldPool {
     const to = parseShieldedAddress(toShielded);
     const fee = await this.sendFee(mint, amount);
     await this.sync(mint);
-    const inputs = this.selectInputs(mint, amount + fee);
+    const inputs = await this.selectInputsMerging(mint, amount + fee, onProgress);
     const inSum = inputs.reduce((s, n) => s + n.amount, 0n);
     const pay = newUtxo({ amount, pubkey: to.utxoPubkey, mint });
     const change = newUtxo({ amount: inSum - amount - fee, pubkey: this.keys.utxoPubkey, privkey: this.keys.utxoPrivkey, mint });
