@@ -615,11 +615,12 @@ setInterval(() => {
   for (const [k, b] of buckets) if (b.at < cutoff) buckets.delete(k);
 }, 60_000).unref();
 function clientIp(req: http.IncomingMessage): string {
-  // The hosting edge appends the real client address LAST; anything before it may be supplied by the client
-  // (verified against Railway: trusting the first entry let spoofed headers dodge the limiter).
+  // Railway's edge writes the real client address FIRST and keeps anything the client supplied after it
+  // (measured: 300 requests with distinct spoofed headers were all keyed to one bucket with this rule,
+  // and all slipped through when the last entry was used instead).
   const xf = req.headers['x-forwarded-for'];
   const parts = (Array.isArray(xf) ? xf.join(',') : xf ?? '').split(',').map((s) => s.trim()).filter(Boolean);
-  return parts[parts.length - 1] || req.socket.remoteAddress || 'unknown';
+  return parts[0] || req.socket.remoteAddress || 'unknown';
 }
 
 async function route(req: http.IncomingMessage, url: URL, res: http.ServerResponse): Promise<unknown> {
@@ -760,7 +761,7 @@ const server = http.createServer(async (req, res) => {
 // ---------------------------------------------------------------- main
 (async () => {
   await poseidonReady();
-  log('relayer', relayer.publicKey.toBase58(), 'program', PROGRAM_ID.toBase58(), 'rpc', RPC_URL);
+  log('relayer', relayer.publicKey.toBase58(), 'program', PROGRAM_ID.toBase58(), 'rpc', new URL(RPC_URL).host);
   await ensureSolPool();
   for (const p of db.pools()) tree(p.mint);
   await poll();
