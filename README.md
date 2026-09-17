@@ -48,8 +48,31 @@ note to yourself. The relayer submits it. The chain sees two new commitments and
 recipient's token account, and pays gas, so the recipient wallet needs nothing and is never a signer.
 
 **What stays public.** The amounts entering and leaving each vault and the wallets at those two doors, which token
-a transaction touches, and timing. Everything between the doors is hidden. Privacy at the doors grows with the
-number of people using a pool.
+a transaction touches, and timing. Everything between the doors is hidden: a wallet that shields 1,000 and pays
+250 to three people shows up on chain as one 1,000 deposit and three relayer-signed transactions that carry no
+sender, no receiver and no amount. There is no on-chain path from the depositing wallet to whoever withdraws.
+
+The doors are where an observer can still guess. If someone withdraws exactly 250 to a fresh wallet ten minutes
+after a 1,000 deposit into a quiet pool, timing and amount make the link easy to suspect. Withdraw amounts that
+do not match a deposit, do not rush, and the guess weakens with every other person using the pool.
+
+## Pool addresses
+
+Every token has one vault: the associated token account of the program's config PDA for that mint. Explorers and
+trading terminals count a vault as an ordinary holder, so labelling the owner below as "zPOOL" catches every pool,
+including ones opened later.
+
+| | |
+|---|---|
+| Vault owner, every token | `C8QRkGNDYxKRZaMhGYCFgjehTzCGbmQ1Y9PQbbHU752o` |
+| SOL vault | `2CiiYUTahmecBs6c2SwKpRCcvWsaoxQD72kjgni5ZNS4` |
+| USDC vault | `8khxAMf6BpLd1c4HqWBrNZfLryzmBcywE4nUtkvjwrQY` |
+| ZCAT vault | `HwrF7f1zzwn4CneDonmJBCGofTqvRiyWk9f3y7YnM8Px` |
+| Any other token | associated token account of the vault owner for that mint (`vaultAta()` in `sdk/src/program.ts`) |
+
+Opening a pool costs about 0.048 SOL of rent for the Merkle tree and the vault, paid once by whoever opens it.
+That rent is locked: the program has no instruction that closes a tree or a vault, so nobody, the maintainers
+included, can shut a pool or reclaim its rent without an upgrade.
 
 ## Fees
 
