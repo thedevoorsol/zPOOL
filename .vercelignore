@@ -1,0 +1,14 @@
+node_modules
+*/node_modules
+/relayer
+program/programs
+program/tests
+program/target/deploy
+program/target/release
+program/target/debug
+program/target/sbpf-solana-solana
+/circuits
+/scripts
+*.sqlite
+app/screenshots
+Dockerfile

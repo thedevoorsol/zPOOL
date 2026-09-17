@@ -1,0 +1,16 @@
+node_modules
+**/node_modules
+app/dist
+app/.env.local
+.env
+.env.*
+!.env.example
+program/target/*
+!program/target/idl
+!program/target/idl/shieldpool.json
+program/.anchor
+*-keypair.json
+keys/
+*.sqlite
+.vercel
+.DS_Store

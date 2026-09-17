@@ -1,0 +1,1473 @@
+{
+  "address": "7Bts9gjMRYG577hbipnAZMuEiBWnGy4SwkqN8TjRpuVF",
+  "metadata": {
+    "name": "shieldpool",
+    "version": "0.1.0",
+    "spec": "0.1.0",
+    "description": "Shielded pool for any Solana token (fork of Privacy Cash shieldpool)"
+  },
+  "instructions": [
+    {
+      "name": "create_pool",
+      "docs": [
+        "Permissionless: open the shielded pool (Merkle tree + vault) for any mint. Payer covers rent."
+      ],
+      "discriminator": [
+        233,
+        146,
+        209,
+        142,
+        207,
+        104,
+        64,
+        188
+      ],
+      "accounts": [
+        {
+          "name": "tree_account",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  101,
+                  114,
+                  107,
+                  108,
+                  101,
+                  95,
+                  116,
+                  114,
+                  101,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "mint"
+        },
+        {
+          "name": "global_config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "global_config"
+              },
+              {
+                "kind": "account",
+                "path": "token_program"
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
+        },
+        {
+          "name": "payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "token_program"
+        },
+        {
+          "name": "associated_token_program",
+          "address": "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "initialize",
+      "docs": [
+        "One-time protocol setup: SOL tree + SOL vault + global config. Whoever calls it is the authority."
+      ],
+      "discriminator": [
+        175,
+        175,
+        109,
+        31,
+        13,
+        152,
+        155,
+        237
+      ],
+      "accounts": [
+        {
+          "name": "tree_account",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  101,
+                  114,
+                  107,
+                  108,
+                  101,
+                  95,
+                  116,
+                  114,
+                  101,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "tree_token_account",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  101,
+                  101,
+                  95,
+                  116,
+                  111,
+                  107,
+                  101,
+                  110
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "global_config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "withdrawal_fee_rate",
+          "type": "u16"
+        }
+      ]
+    },
+    {
+      "name": "transact",
+      "docs": [
+        "Deposit / withdraw / in-pool payment for native SOL.",
+        "Reentrancy is impossible: nullifier accounts are created by Anchor before the body runs."
+      ],
+      "discriminator": [
+        217,
+        149,
+        130,
+        143,
+        221,
+        52,
+        252,
+        119
+      ],
+      "accounts": [
+        {
+          "name": "tree_account",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  101,
+                  114,
+                  107,
+                  108,
+                  101,
+                  95,
+                  116,
+                  114,
+                  101,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "nullifier0",
+          "docs": [
+            "`init` (not `init_if_needed`): a spent nullifier fails at account creation."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  110,
+                  117,
+                  108,
+                  108,
+                  105,
+                  102,
+                  105,
+                  101,
+                  114,
+                  48
+                ]
+              },
+              {
+                "kind": "arg",
+                "path": "proof.input_nullifiers [0]"
+              }
+            ]
+          }
+        },
+        {
+          "name": "nullifier1",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  110,
+                  117,
+                  108,
+                  108,
+                  105,
+                  102,
+                  105,
+                  101,
+                  114,
+                  49
+                ]
+              },
+              {
+                "kind": "arg",
+                "path": "proof.input_nullifiers [1]"
+              }
+            ]
+          }
+        },
+        {
+          "name": "nullifier2",
+          "docs": [
+            "Cross-check PDAs (HashCloak ZKC-7): the same nullifier under the other prefix must not exist either."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  110,
+                  117,
+                  108,
+                  108,
+                  105,
+                  102,
+                  105,
+                  101,
+                  114,
+                  48
+                ]
+              },
+              {
+                "kind": "arg",
+                "path": "proof.input_nullifiers [1]"
+              }
+            ]
+          }
+        },
+        {
+          "name": "nullifier3",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  110,
+                  117,
+                  108,
+                  108,
+                  105,
+                  102,
+                  105,
+                  101,
+                  114,
+                  49
+                ]
+              },
+              {
+                "kind": "arg",
+                "path": "proof.input_nullifiers [0]"
+              }
+            ]
+          }
+        },
+        {
+          "name": "tree_token_account",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  101,
+                  101,
+                  95,
+                  116,
+                  111,
+                  107,
+                  101,
+                  110
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "global_config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "recipient",
+          "writable": true
+        },
+        {
+          "name": "fee_recipient_account",
+          "writable": true
+        },
+        {
+          "name": "signer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "proof",
+          "type": {
+            "defined": {
+              "name": "Proof"
+            }
+          }
+        },
+        {
+          "name": "ext_data_minified",
+          "type": {
+            "defined": {
+              "name": "ExtDataMinified"
+            }
+          }
+        },
+        {
+          "name": "encrypted_output1",
+          "type": "bytes"
+        },
+        {
+          "name": "encrypted_output2",
+          "type": "bytes"
+        }
+      ]
+    },
+    {
+      "name": "transact_spl",
+      "docs": [
+        "Deposit / withdraw / in-pool payment for any SPL or Token-2022 mint.",
+        "Transfer-hook mints: pass the hook program, its validation account and extra metas as remaining accounts."
+      ],
+      "discriminator": [
+        154,
+        66,
+        244,
+        204,
+        78,
+        225,
+        163,
+        151
+      ],
+      "accounts": [
+        {
+          "name": "tree_account",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  101,
+                  114,
+                  107,
+                  108,
+                  101,
+                  95,
+                  116,
+                  114,
+                  101,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "nullifier0",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  110,
+                  117,
+                  108,
+                  108,
+                  105,
+                  102,
+                  105,
+                  101,
+                  114,
+                  48
+                ]
+              },
+              {
+                "kind": "arg",
+                "path": "proof.input_nullifiers [0]"
+              }
+            ]
+          }
+        },
+        {
+          "name": "nullifier1",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  110,
+                  117,
+                  108,
+                  108,
+                  105,
+                  102,
+                  105,
+                  101,
+                  114,
+                  49
+                ]
+              },
+              {
+                "kind": "arg",
+                "path": "proof.input_nullifiers [1]"
+              }
+            ]
+          }
+        },
+        {
+          "name": "nullifier2",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  110,
+                  117,
+                  108,
+                  108,
+                  105,
+                  102,
+                  105,
+                  101,
+                  114,
+                  48
+                ]
+              },
+              {
+                "kind": "arg",
+                "path": "proof.input_nullifiers [1]"
+              }
+            ]
+          }
+        },
+        {
+          "name": "nullifier3",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  110,
+                  117,
+                  108,
+                  108,
+                  105,
+                  102,
+                  105,
+                  101,
+                  114,
+                  49
+                ]
+              },
+              {
+                "kind": "arg",
+                "path": "proof.input_nullifiers [0]"
+              }
+            ]
+          }
+        },
+        {
+          "name": "global_config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "signer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "mint"
+        },
+        {
+          "name": "signer_token_account",
+          "docs": [
+            "Source for deposits (must be owned by `signer`, checked in the handler)."
+          ],
+          "writable": true
+        },
+        {
+          "name": "recipient"
+        },
+        {
+          "name": "recipient_token_account",
+          "docs": [
+            "Destination for withdrawals. The relayer pre-creates it so rent griefing is impossible."
+          ],
+          "writable": true
+        },
+        {
+          "name": "tree_ata",
+          "docs": [
+            "The pool vault: ATA of `global_config` for this mint."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "global_config"
+              },
+              {
+                "kind": "account",
+                "path": "token_program"
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
+        },
+        {
+          "name": "fee_recipient_ata",
+          "docs": [
+            "Must be owned by `global_config.fee_recipient` whenever fee > 0 (checked in the handler)."
+          ],
+          "writable": true
+        },
+        {
+          "name": "token_program"
+        },
+        {
+          "name": "associated_token_program",
+          "address": "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "proof",
+          "type": {
+            "defined": {
+              "name": "Proof"
+            }
+          }
+        },
+        {
+          "name": "ext_data_minified",
+          "type": {
+            "defined": {
+              "name": "ExtDataMinified"
+            }
+          }
+        },
+        {
+          "name": "encrypted_output1",
+          "type": "bytes"
+        },
+        {
+          "name": "encrypted_output2",
+          "type": "bytes"
+        }
+      ]
+    },
+    {
+      "name": "update_deposit_limit",
+      "docs": [
+        "Authority only: cap deposits for one pool (u64::MAX = no cap)."
+      ],
+      "discriminator": [
+        181,
+        115,
+        65,
+        169,
+        4,
+        1,
+        96,
+        109
+      ],
+      "accounts": [
+        {
+          "name": "tree_account",
+          "writable": true
+        },
+        {
+          "name": "authority",
+          "signer": true,
+          "relations": [
+            "tree_account"
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "new_limit",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "update_global_config",
+      "docs": [
+        "Authority only: change fee rates and/or the protocol fee recipient."
+      ],
+      "discriminator": [
+        164,
+        84,
+        130,
+        189,
+        111,
+        58,
+        250,
+        200
+      ],
+      "accounts": [
+        {
+          "name": "global_config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "authority",
+          "signer": true,
+          "relations": [
+            "global_config"
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "deposit_fee_rate",
+          "type": {
+            "option": "u16"
+          }
+        },
+        {
+          "name": "withdrawal_fee_rate",
+          "type": {
+            "option": "u16"
+          }
+        },
+        {
+          "name": "fee_error_margin",
+          "type": {
+            "option": "u16"
+          }
+        },
+        {
+          "name": "fee_recipient",
+          "type": {
+            "option": "pubkey"
+          }
+        }
+      ]
+    }
+  ],
+  "accounts": [
+    {
+      "name": "GlobalConfig",
+      "discriminator": [
+        149,
+        8,
+        156,
+        202,
+        160,
+        252,
+        176,
+        217
+      ]
+    },
+    {
+      "name": "MerkleTreeAccount",
+      "discriminator": [
+        147,
+        200,
+        34,
+        248,
+        131,
+        187,
+        248,
+        253
+      ]
+    },
+    {
+      "name": "NullifierAccount",
+      "discriminator": [
+        250,
+        31,
+        238,
+        177,
+        213,
+        98,
+        48,
+        172
+      ]
+    },
+    {
+      "name": "TreeTokenAccount",
+      "discriminator": [
+        153,
+        63,
+        39,
+        198,
+        74,
+        80,
+        37,
+        204
+      ]
+    }
+  ],
+  "events": [
+    {
+      "name": "CommitmentData",
+      "discriminator": [
+        13,
+        110,
+        215,
+        127,
+        244,
+        62,
+        234,
+        34
+      ]
+    },
+    {
+      "name": "PoolCreated",
+      "discriminator": [
+        202,
+        44,
+        41,
+        88,
+        104,
+        220,
+        157,
+        82
+      ]
+    },
+    {
+      "name": "SplCommitmentData",
+      "discriminator": [
+        236,
+        10,
+        189,
+        217,
+        173,
+        102,
+        131,
+        85
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "code": 6000,
+      "name": "Unauthorized",
+      "msg": "Not authorized to perform this action"
+    },
+    {
+      "code": 6001,
+      "name": "ExtDataHashMismatch",
+      "msg": "External data hash does not match the one in the proof"
+    },
+    {
+      "code": 6002,
+      "name": "UnknownRoot",
+      "msg": "Root is not known in the tree"
+    },
+    {
+      "code": 6003,
+      "name": "InvalidPublicAmountData",
+      "msg": "Public amount is invalid"
+    },
+    {
+      "code": 6004,
+      "name": "InsufficientFundsForWithdrawal",
+      "msg": "Insufficient funds for withdrawal"
+    },
+    {
+      "code": 6005,
+      "name": "InsufficientFundsForFee",
+      "msg": "Insufficient funds for fee"
+    },
+    {
+      "code": 6006,
+      "name": "InvalidProof",
+      "msg": "Proof is invalid"
+    },
+    {
+      "code": 6007,
+      "name": "InvalidFee",
+      "msg": "Invalid fee: fee must be less than MAX_ALLOWED_VAL (2^248)."
+    },
+    {
+      "code": 6008,
+      "name": "InvalidExtAmount",
+      "msg": "Invalid ext amount: absolute ext_amount must be less than MAX_ALLOWED_VAL (2^248)."
+    },
+    {
+      "code": 6009,
+      "name": "PublicAmountCalculationError",
+      "msg": "Public amount calculation resulted in an overflow/underflow."
+    },
+    {
+      "code": 6010,
+      "name": "ArithmeticOverflow",
+      "msg": "Arithmetic overflow/underflow occurred"
+    },
+    {
+      "code": 6011,
+      "name": "DepositLimitExceeded",
+      "msg": "Deposit limit exceeded"
+    },
+    {
+      "code": 6012,
+      "name": "InvalidFeeRate",
+      "msg": "Invalid fee rate: must be between 0 and 10000 basis points"
+    },
+    {
+      "code": 6013,
+      "name": "InvalidFeeRecipient",
+      "msg": "Fee recipient does not match global configuration"
+    },
+    {
+      "code": 6014,
+      "name": "InvalidFeeAmount",
+      "msg": "Fee amount is below minimum required"
+    },
+    {
+      "code": 6015,
+      "name": "RecipientMismatch",
+      "msg": "Recipient account does not match the ExtData recipient"
+    },
+    {
+      "code": 6016,
+      "name": "MerkleTreeFull",
+      "msg": "Merkle tree is full: cannot add more leaves"
+    },
+    {
+      "code": 6017,
+      "name": "InvalidTokenAccount",
+      "msg": "Invalid token account: account is not owned by the token program"
+    },
+    {
+      "code": 6018,
+      "name": "InvalidMintAddress",
+      "msg": "Invalid mint address"
+    },
+    {
+      "code": 6019,
+      "name": "InvalidTokenAccountMintAddress",
+      "msg": "Invalid token account mint address"
+    },
+    {
+      "code": 6020,
+      "name": "UnsupportedMintExtension",
+      "msg": "Mint has an extension the pool cannot support (non-transferable)"
+    },
+    {
+      "code": 6021,
+      "name": "DepositAmountMismatch",
+      "msg": "Vault did not receive exactly the deposited amount"
+    }
+  ],
+  "types": [
+    {
+      "name": "CommitmentData",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "index",
+            "type": "u64"
+          },
+          {
+            "name": "commitment",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "encrypted_output",
+            "type": "bytes"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ExtDataMinified",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "ext_amount",
+            "type": "i64"
+          },
+          {
+            "name": "fee",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "GlobalConfig",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "fee_recipient",
+            "type": "pubkey"
+          },
+          {
+            "name": "deposit_fee_rate",
+            "type": "u16"
+          },
+          {
+            "name": "withdrawal_fee_rate",
+            "type": "u16"
+          },
+          {
+            "name": "fee_error_margin",
+            "type": "u16"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MerkleTreeAccount",
+      "serialization": "bytemuck",
+      "repr": {
+        "kind": "c"
+      },
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "next_index",
+            "type": "u64"
+          },
+          {
+            "name": "subtrees",
+            "type": {
+              "array": [
+                {
+                  "array": [
+                    "u8",
+                    32
+                  ]
+                },
+                26
+              ]
+            }
+          },
+          {
+            "name": "root",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "root_history",
+            "type": {
+              "array": [
+                {
+                  "array": [
+                    "u8",
+                    32
+                  ]
+                },
+                250
+              ]
+            }
+          },
+          {
+            "name": "root_index",
+            "type": "u64"
+          },
+          {
+            "name": "max_deposit_amount",
+            "type": "u64"
+          },
+          {
+            "name": "height",
+            "type": "u8"
+          },
+          {
+            "name": "root_history_size",
+            "type": "u8"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "_padding",
+            "type": {
+              "array": [
+                "u8",
+                5
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "NullifierAccount",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PoolCreated",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "token_program",
+            "type": "pubkey"
+          },
+          {
+            "name": "tree",
+            "type": "pubkey"
+          },
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "decimals",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Proof",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "proof_a",
+            "type": {
+              "array": [
+                "u8",
+                64
+              ]
+            }
+          },
+          {
+            "name": "proof_b",
+            "type": {
+              "array": [
+                "u8",
+                128
+              ]
+            }
+          },
+          {
+            "name": "proof_c",
+            "type": {
+              "array": [
+                "u8",
+                64
+              ]
+            }
+          },
+          {
+            "name": "root",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "public_amount",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "ext_data_hash",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "input_nullifiers",
+            "type": {
+              "array": [
+                {
+                  "array": [
+                    "u8",
+                    32
+                  ]
+                },
+                2
+              ]
+            }
+          },
+          {
+            "name": "output_commitments",
+            "type": {
+              "array": [
+                {
+                  "array": [
+                    "u8",
+                    32
+                  ]
+                },
+                2
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "SplCommitmentData",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "index",
+            "type": "u64"
+          },
+          {
+            "name": "mint_address",
+            "type": "pubkey"
+          },
+          {
+            "name": "commitment",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "encrypted_output",
+            "type": "bytes"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TreeTokenAccount",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    }
+  ]
+}

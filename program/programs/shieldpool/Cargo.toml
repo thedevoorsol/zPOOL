@@ -1,0 +1,38 @@
+[package]
+name = "shieldpool"
+version = "0.1.0"
+description = "Shielded pool for any Solana token (fork of Privacy Cash shieldpool)"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "shieldpool"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+custom-heap = []
+custom-panic = []
+anchor-debug = []
+
+[dependencies]
+anchor-lang = { version = "0.31.1", features = ["init-if-needed"] }
+anchor-spl = "0.31.1"
+spl-token-2022 = { version = "6.0.0", features = ["no-entrypoint"] }
+bytemuck = { version = "1.20.0", features = ["derive", "min_const_generics"] }
+light-poseidon = "0.4.0"
+light-hasher = "4.0.0"
+num-bigint = "0.4.4"
+ark-bn254 = { version = "0.5.0", features = [] }
+ark-ff = { version = "0.5.0", features = [] }
+ark-serialize = { version = "0.5.0", features = [] }
+thiserror = "1.0.69"
+solana-bn254 = "2.2.2"
+
+[dev-dependencies]
+lazy_static = "1.4.0"
+rand = "0.9.0"

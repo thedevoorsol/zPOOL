@@ -1,0 +1,23 @@
+{
+  "name": "shieldpool",
+  "private": true,
+  "workspaces": [
+    "sdk",
+    "relayer",
+    "app"
+  ],
+  "scripts": {
+    "typecheck": "npm run typecheck -w sdk && npm run typecheck -w relayer && npm run -w app build",
+    "relayer": "npm run -w relayer start",
+    "app": "npm run -w app dev",
+    "e2e": "tsx scripts/e2e.ts",
+    "browser-e2e": "tsx scripts/browser-e2e.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "tsx": "^4.19.0",
+    "tweetnacl": "^1.0.3",
+    "typescript": "^5.9.2"
+  },
+  "type": "module"
+}

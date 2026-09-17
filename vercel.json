@@ -1,0 +1,12 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "installCommand": "npm install --workspace sdk --workspace app --include-workspace-root --no-audit --no-fund",
+  "buildCommand": "npm run -w app build",
+  "outputDirectory": "app/dist",
+  "headers": [
+    { "source": "/circuits/(.*)", "headers": [{ "key": "cache-control", "value": "public, max-age=31536000, immutable" }] },
+    { "source": "/(.*)", "headers": [{ "key": "x-content-type-options", "value": "nosniff" }] }
+  ],
+  "rewrites": [{ "source": "/((?!circuits/|assets/).*)", "destination": "/index.html" }]
+}
