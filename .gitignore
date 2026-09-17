@@ -1,7 +1,5 @@
 node_modules
 **/node_modules
-app/dist
-app/.env.local
 .env
 .env.*
 !.env.example

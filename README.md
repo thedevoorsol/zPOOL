@@ -64,13 +64,14 @@ The fee recipient is enforced by the program, not by the relayer, so it cannot b
 ## Repository
 
 ```
-program/   Anchor program `shieldpool` (Rust). target/idl/shieldpool.json is the IDL clients use.
+program/   Anchor program `shieldpool` (Rust). target/idl/shieldpool.json is the IDL the clients use.
 circuits/  transaction2.{wasm,zkey}, verifyingkey2.json, circom sources, ceremony record (unchanged upstream)
-sdk/       TypeScript client: keys, notes, Merkle tree, prover (snarkjs, browser + node), program bindings
+sdk/       TypeScript client: keys, notes, Merkle tree, prover (snarkjs), program bindings, ShieldPool
 relayer/   indexer + relayer service (Node 24, SQLite built in), pays gas for withdrawals and private payments
-app/       the web app (Vite + React + wallet-standard)
-scripts/   e2e.ts (keypair round trip), browser-e2e.ts (headless Chromium through the real UI), admin helpers
+scripts/   e2e.ts: full round trip with two keypairs; init-mainnet.ts and set-fees.ts: one-time protocol config
 ```
+
+The web app that fronts this at https://www.zpool.fun is a thin client over `sdk/` and is not part of this repository.
 
 ### Changes from Privacy Cash
 
@@ -95,11 +96,11 @@ solana-test-validator --reset --limit-ledger-size 100000000 \
 cd program && anchor build && solana program deploy target/deploy/shieldpool.so --program-id <keypair> --url http://127.0.0.1:8899
 RPC_URL=http://127.0.0.1:8899 RELAYER_KEYPAIR=<relayer.json> DB_PATH=./relayer.sqlite CHAIN=solana:localnet npm run relayer
 RPC_URL=http://127.0.0.1:8899 RELAYER_URL=http://127.0.0.1:8787 KEYS_DIR=<dir with deployer.json + relayer.json> npm run e2e
-cd app && cp .env.example .env.local && npm run dev
 ```
 
-`npm run e2e` opens pools for a legacy SPL mint, a Token-2022 mint with a 1% transfer fee and native SOL, then
-deposits, pays privately to a second user, and withdraws to a never-funded wallet for each.
+`npm run e2e` initializes the program, opens pools for a legacy SPL mint, a Token-2022 mint with a 1% transfer fee
+and native SOL, then for each: deposits 1000, pays 250 privately to a second user, has that user withdraw 100 to a
+never-funded wallet, and checks every balance and the protocol fee account. It prints `E2E OK` when all of it holds.
 
 ## Verify the on-chain program
 
