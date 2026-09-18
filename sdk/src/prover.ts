@@ -115,3 +115,9 @@ export function fieldHashToDecimal(hash: Uint8Array, fieldSize: bigint): string 
   for (let i = hash.length - 1; i >= 0; i--) n = (n << 8n) | BigInt(hash[i]);
   return (n % fieldSize).toString();
 }
+
+/** Node only: snarkjs keeps worker threads alive after a proof; call this before exiting a script. No-op in browsers. */
+export async function terminateProver(): Promise<void> {
+  const g = globalThis as unknown as { curve_bn128?: { terminate: () => Promise<void> } };
+  if (g.curve_bn128) await g.curve_bn128.terminate();
+}

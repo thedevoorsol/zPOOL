@@ -1,6 +1,6 @@
 {
   "name": "zpool-sdk",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "zPOOL: shielded pool for any Solana token. Shield, pay privately, unshield, with proofs in the browser and a relayer paying gas.",
   "license": "BUSL-1.1",
   "homepage": "https://www.zpool.fun/docs",

@@ -43,6 +43,7 @@ Your `partner` fee is charged on shields, the only step the user's wallet signs.
 - `relayerUrl` defaults to the public relayer. Anyone can run their own from the repository.
 - `artifacts` default to the circuit files hosted at zpool.fun (about 20 MB, cached). Host your own copy for full independence.
 - Proving runs in a Web Worker when the bundler supports `new URL('./prover.worker.js', import.meta.url)` (Vite, webpack 5, Rollup). Otherwise it falls back to the main thread. `setUseWorker(false)` forces the main thread.
+- In Node, call `await terminateProver()` before your script exits: snarkjs keeps worker threads alive after a proof.
 - Deposits are built as v0 transactions with a lookup table, about 1.1 KB. Pass `{ version: 1 }` for wallets that advertise transaction v1.
 
 ## Privacy
