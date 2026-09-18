@@ -165,6 +165,8 @@ export class ShieldPool {
     inputs: Utxo[];
     outputs: [Utxo, Utxo];
     outputEncPubs: [Uint8Array, Uint8Array];
+    /** leave the second ciphertext empty (a zero-value placeholder note nobody needs to read); saves 132 bytes */
+    emptySecond?: boolean;
     extAmount: bigint;
     fee: bigint;
     recipient: PublicKey;
@@ -182,7 +184,7 @@ export class ShieldPool {
     const { root } = await this.relayer.merkleRoot(mint.toBase58());
 
     const enc1 = encryptNote(args.outputs[0], args.outputEncPubs[0]);
-    const enc2 = encryptNote(args.outputs[1], args.outputEncPubs[1]);
+    const enc2 = args.emptySecond ? new Uint8Array(0) : encryptNote(args.outputs[1], args.outputEncPubs[1]);
     const ext: ExtData = {
       recipient: args.recipient,
       extAmount: args.extAmount,
@@ -378,8 +380,11 @@ export class ShieldPool {
       fee: depositFee,
       recipient: source,
       feeRecipient: isSol ? feeRecipient : ata(feeRecipient, mint, tokenProgram),
+      emptySecond: true,
     });
     onProgress?.({ step: 'building', detail: 'assembling transaction' });
+    // Keep wallet-signed deposits small: wallets such as Phantom append their own guard instructions
+    // (Lighthouse) before sending and warn when the transaction leaves them no room under 1,232 bytes.
     const ixs: TransactionInstruction[] = [computeBudgetIx()];
     if (isSol) {
       ixs.push(await transactSolIx(this.program, { proof, extAmount: amount, fee: depositFee, encryptedOutput1: enc1, encryptedOutput2: enc2, signer, recipient: signer, feeRecipient }));
@@ -459,7 +464,7 @@ export class ShieldPool {
       createTransactionMessage({ version: 1 }),
       (m) => setTransactionMessageFeePayer(kitAddress(signer.toBase58()), m),
       (m) => setTransactionMessageLifetimeUsingBlockhash(bh, m),
-      (m) => appendTransactionMessageInstructions(ixs.slice(1).map(toKit), m), // compute budget lives in the v1 header
+      (m) => appendTransactionMessageInstructions(ixs.slice(1).map(toKit), m), // compute limit lives in the v1 header
       (m) => setTransactionMessageComputeUnitLimit(1_400_000, m),
       (m) => setTransactionMessageLoadedAccountsDataSizeLimit(16_000_000, m),
     );

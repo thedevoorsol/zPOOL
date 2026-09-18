@@ -81,6 +81,10 @@ export type TransactArgs = {
 export function computeBudgetIx(units = COMPUTE_UNITS): TransactionInstruction {
   return ComputeBudgetProgram.setComputeUnitLimit({ units });
 }
+/** Small explicit priority fee (0.0003 SOL at the full limit is the ceiling; typical spend is far lower). */
+export function priorityFeeIx(microLamports = 300): TransactionInstruction {
+  return ComputeBudgetProgram.setComputeUnitPrice({ microLamports });
+}
 
 export async function transactSolIx(program: Program, a: TransactArgs): Promise<TransactionInstruction> {
   const programId = program.programId;
