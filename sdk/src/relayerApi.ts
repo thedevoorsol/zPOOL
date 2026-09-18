@@ -39,7 +39,7 @@ export type UtxoRow = { index: number; commitment: string; encryptedOutput: stri
 export type RelayRequest = {
   kind: 'withdraw' | 'send';
   mint: string;
-  proof: import('./prover').OnchainProof;
+  proof: import('./prover.js').OnchainProof;
   extAmount: string;
   fee: string;
   recipient: string;

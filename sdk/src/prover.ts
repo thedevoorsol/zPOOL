@@ -1,6 +1,6 @@
 /** Groth16 proving with snarkjs, output formatted for the on-chain verifier (big-endian, G2 limbs swapped). */
 import { groth16 } from 'snarkjs';
-import { bigToBytes32BE } from './crypto';
+import { bigToBytes32BE } from './crypto.js';
 
 export type Artifacts = { wasm: string | Uint8Array; zkey: string | Uint8Array };
 
@@ -36,10 +36,26 @@ function be(x: string): number[] {
   return Array.from(bigToBytes32BE(BigInt(x)));
 }
 
+const artifactCache = new Map<string, Uint8Array>();
+/** In Node, snarkjs treats a string as a file path; fetch http(s) artifacts into memory once. Browsers fetch URLs natively. */
+async function resolveArtifact(a: string | Uint8Array): Promise<string | { type: 'mem'; data: Uint8Array }> {
+  if (typeof a !== 'string') return { type: 'mem', data: a };
+  const isUrl = /^https?:\/\//.test(a);
+  if (!isUrl || typeof window !== 'undefined') return a;
+  let data = artifactCache.get(a);
+  if (!data) {
+    const r = await fetch(a);
+    if (!r.ok) throw new Error(`artifact ${a}: ${r.status}`);
+    data = new Uint8Array(await r.arrayBuffer());
+    artifactCache.set(a, data);
+  }
+  return { type: 'mem', data };
+}
+
 /** Raw snarkjs call; used on the main thread and inside the worker. */
 export async function fullProve(input: CircuitInput, artifacts: Artifacts): Promise<{ proof: unknown; publicSignals: string[] }> {
-  const wasm = typeof artifacts.wasm === 'string' ? artifacts.wasm : { type: 'mem', data: artifacts.wasm };
-  const zkey = typeof artifacts.zkey === 'string' ? artifacts.zkey : { type: 'mem', data: artifacts.zkey };
+  const wasm = await resolveArtifact(artifacts.wasm);
+  const zkey = await resolveArtifact(artifacts.zkey);
   const r = await groth16.fullProve(input as never, wasm as never, zkey as never);
   return { proof: r.proof, publicSignals: r.publicSignals as string[] };
 }

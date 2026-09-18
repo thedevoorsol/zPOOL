@@ -7,7 +7,7 @@
 import { sha256 } from '@noble/hashes/sha2';
 import { x25519 } from '@noble/curves/ed25519';
 import bs58 from 'bs58';
-import { FIELD_SIZE_BIG, bigToBytes32BE, bytesToBigBE, concat, poseidon } from './crypto';
+import { FIELD_SIZE_BIG, bigToBytes32BE, bytesToBigBE, concat, poseidon } from './crypto.js';
 
 export const KEY_MESSAGE_PREFIX = 'shieldpool/v1: derive my shielded keys for wallet ';
 

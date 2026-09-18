@@ -1,7 +1,7 @@
 /** Tornado-Nova style notes. Commitment = Poseidon(amount, pubkey, blinding, mintField). */
 import { PublicKey } from '@solana/web3.js';
 import BN from 'bn.js';
-import { bytesToBigBE, poseidon, randomFieldBelow } from './crypto';
+import { bytesToBigBE, poseidon, randomFieldBelow } from './crypto.js';
 
 export const SOL_MINT = new PublicKey('11111111111111111111111111111112');
 

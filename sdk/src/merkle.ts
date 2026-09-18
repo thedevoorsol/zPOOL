@@ -1,5 +1,5 @@
 /** Client-side mirror of the on-chain Poseidon Merkle tree (height 26, zero leaf = 0). */
-import { poseidon } from './crypto';
+import { poseidon } from './crypto.js';
 
 export const TREE_LEVELS = 26;
 

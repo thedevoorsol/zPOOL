@@ -7,8 +7,8 @@ import { x25519 } from '@noble/curves/ed25519';
 import { hkdf } from '@noble/hashes/hkdf';
 import { sha256 } from '@noble/hashes/sha2';
 import { PublicKey } from '@solana/web3.js';
-import { bigToBytes32BE, bytesToBigBE, concat } from './crypto';
-import type { Utxo } from './utxo';
+import { bigToBytes32BE, bytesToBigBE, concat } from './crypto.js';
+import type { Utxo } from './utxo.js';
 
 const VERSION = 0x02;
 const INFO = new TextEncoder().encode('shieldpool-note-v2');

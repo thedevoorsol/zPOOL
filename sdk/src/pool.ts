@@ -1,13 +1,14 @@
 /**
  * High-level client: unlock, sync notes, deposit (wallet signs), withdraw / send (relayer signs).
  */
-import { TOKEN_2022_PROGRAM_ID, calculateEpochFee, getTransferFeeConfig, unpackMint, type TransferFeeConfig } from '@solana/spl-token';
+import { TOKEN_2022_PROGRAM_ID, calculateEpochFee, createTransferCheckedInstruction, getTransferFeeConfig, unpackMint, type TransferFeeConfig } from '@solana/spl-token';
 import { AddressLookupTableAccount, Connection, PublicKey, SystemProgram, TransactionMessage, VersionedTransaction, type TransactionInstruction } from '@solana/web3.js';
 import {
   AccountRole,
   address as kitAddress,
   appendTransactionMessageInstructions,
   compileTransaction,
+  createSolanaRpc,
   createTransactionMessage,
   getTransactionEncoder,
   pipe,
@@ -18,14 +19,14 @@ import {
   type Instruction,
 } from '@solana/kit';
 import type { Program } from '@coral-xyz/anchor';
-import { FIELD_SIZE_BIG, bytesToHex, hexToBytes, poseidonReady } from './crypto';
-import { extDataHash, type ExtData } from './extdata';
-import { keyDerivationMessage, keysFromSignature, parseShieldedAddress, shieldedAddress, type ShieldKeys } from './keys';
-import { encryptNote, tryDecryptNote } from './notes';
-import { PROGRAM_ID, ata, computeBudgetIx, createPoolIx, getProgram, hookAccounts, nullifierAccounts, transactSolIx, transactSplIx } from './program';
-import { fieldHashToDecimal, prove, publicAmountField, type Artifacts, type CircuitInput, type OnchainProof } from './prover';
-import { RelayerApi, type PoolInfo, type RelayerConfig } from './relayerApi';
-import { SOL_MINT, commitment, mintField, newUtxo, nullifier, type Utxo } from './utxo';
+import { FIELD_SIZE_BIG, bytesToHex, hexToBytes, poseidonReady } from './crypto.js';
+import { extDataHash, type ExtData } from './extdata.js';
+import { keyDerivationMessage, keysFromSignature, parseShieldedAddress, shieldedAddress, type ShieldKeys } from './keys.js';
+import { encryptNote, tryDecryptNote } from './notes.js';
+import { PROGRAM_ID, ata, computeBudgetIx, createPoolIx, getProgram, hookAccounts, nullifierAccounts, transactSolIx, transactSplIx, vaultAta } from './program.js';
+import { fieldHashToDecimal, prove, publicAmountField, type Artifacts, type CircuitInput, type OnchainProof } from './prover.js';
+import { RelayerApi, type PoolInfo, type RelayerConfig } from './relayerApi.js';
+import { SOL_MINT, commitment, mintField, newUtxo, nullifier, type Utxo } from './utxo.js';
 
 export type Progress = { step: string; detail?: string; signature?: string };
 export type ProgressCb = (p: Progress) => void;
@@ -414,7 +415,7 @@ export class ShieldPool {
     if (isSol) {
       ixs.push(await transactSolIx(this.program, { proof, extAmount: amount, fee: depositFee, encryptedOutput1: enc1, encryptedOutput2: enc2, signer, recipient: signer, feeRecipient }));
     } else {
-      const vault = (await import('./program')).vaultAta(mint, tokenProgram, this.program.programId);
+      const vault = vaultAta(mint, tokenProgram, this.program.programId);
       const remainingAccounts = await hookAccounts(this.connection, mint, tokenProgram, source, vault, signer, amount);
       ixs.push(
         await transactSplIx(this.program, {
@@ -440,7 +441,6 @@ export class ShieldPool {
       if (cut > 0n) {
         if (isSol) ixs.push(SystemProgram.transfer({ fromPubkey: signer, toPubkey: opts.partner.address, lamports: cut }));
         else {
-          const { createTransferCheckedInstruction } = await import('@solana/spl-token');
           const decimals = (await this.tokenDecimals(mint)) ?? 0;
           ixs.push(createTransferCheckedInstruction(source, mint, ata(opts.partner.address, mint, tokenProgram), signer, cut, decimals, [], tokenProgram));
         }
@@ -497,7 +497,7 @@ export class ShieldPool {
       return { bytes, version: 0, size: bytes.length };
     }
     const { ixs } = await this.depositInstructions(mint, walletAmount, signer, onProgress, opts);
-    const { value: bh } = await (await import('@solana/kit')).createSolanaRpc(this.connection.rpcEndpoint).getLatestBlockhash({ commitment: 'confirmed' }).send();
+    const { value: bh } = await createSolanaRpc(this.connection.rpcEndpoint).getLatestBlockhash({ commitment: 'confirmed' }).send();
     const toKit = (ix: TransactionInstruction): Instruction => ({
       programAddress: kitAddress(ix.programId.toBase58()),
       accounts: ix.keys.map((k) => ({

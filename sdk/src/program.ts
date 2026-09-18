@@ -2,9 +2,9 @@
 import { AnchorProvider, BN, Program, type Idl } from '@coral-xyz/anchor';
 import { ASSOCIATED_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID, addExtraAccountMetasForExecute, createTransferCheckedInstruction, getAssociatedTokenAddressSync, getTransferHook, unpackMint } from '@solana/spl-token';
 import { ComputeBudgetProgram, Connection, PublicKey, SystemProgram, type TransactionInstruction } from '@solana/web3.js';
-import { SHIELDPOOL_IDL as idlJson } from './idl';
-import type { OnchainProof } from './prover';
-import { SOL_MINT } from './utxo';
+import { SHIELDPOOL_IDL as idlJson } from './idl.js';
+import type { OnchainProof } from './prover.js';
+import { SOL_MINT } from './utxo.js';
 
 export const IDL = idlJson as unknown as Idl;
 export const PROGRAM_ID = new PublicKey((idlJson as { address: string }).address);
