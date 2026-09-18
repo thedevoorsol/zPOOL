@@ -1,6 +1,6 @@
 /** Anchor program bindings: PDAs and instruction builders for shieldpool. */
 import { AnchorProvider, BN, Program, type Idl } from '@coral-xyz/anchor';
-import { ASSOCIATED_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from '@solana/spl-token';
+import { ASSOCIATED_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID, addExtraAccountMetasForExecute, createTransferCheckedInstruction, getAssociatedTokenAddressSync, getTransferHook, unpackMint } from '@solana/spl-token';
 import { ComputeBudgetProgram, Connection, PublicKey, SystemProgram, type TransactionInstruction } from '@solana/web3.js';
 import idlJson from '../../program/target/idl/shieldpool.json' with { type: 'json' };
 import type { OnchainProof } from './prover';
@@ -105,7 +105,7 @@ export async function transactSolIx(program: Program, a: TransactArgs): Promise<
 
 export async function transactSplIx(
   program: Program,
-  a: TransactArgs & { mint: PublicKey; tokenProgram: PublicKey; signerTokenAccount: PublicKey; remainingAccounts?: { pubkey: PublicKey; isSigner: boolean; isWritable: boolean }[] },
+  a: TransactArgs & { mint: PublicKey; tokenProgram: PublicKey; signerTokenAccount: PublicKey; recipientTokenAccount?: PublicKey; remainingAccounts?: { pubkey: PublicKey; isSigner: boolean; isWritable: boolean }[] },
 ): Promise<TransactionInstruction> {
   const programId = program.programId;
   const n = nullifierAccounts(a.proof, programId);
@@ -122,7 +122,7 @@ export async function transactSplIx(
       mint: a.mint,
       signerTokenAccount: a.signerTokenAccount,
       recipient: a.recipient,
-      recipientTokenAccount: ata(a.recipient, a.mint, a.tokenProgram),
+      recipientTokenAccount: a.recipientTokenAccount ?? ata(a.recipient, a.mint, a.tokenProgram),
       treeAta: vaultAta(a.mint, a.tokenProgram, programId),
       feeRecipientAta: ata(a.feeRecipient, a.mint, a.tokenProgram),
       tokenProgram: a.tokenProgram,
@@ -179,4 +179,31 @@ export type GlobalConfigState = { authority: PublicKey; feeRecipient: PublicKey;
 export async function fetchGlobalConfig(program: Program): Promise<GlobalConfigState | null> {
   const acc = await (program.account as never as { globalConfig: { fetchNullable: (k: PublicKey) => Promise<GlobalConfigState | null> } }).globalConfig.fetchNullable(pdaGlobalConfig(program.programId));
   return acc;
+}
+
+/**
+ * Extra accounts a Token-2022 transfer hook needs for a transfer source -> destination, resolved from the hook
+ * program's validation account. Empty for mints without a hook. Passed as remaining accounts to transact_spl.
+ */
+export async function hookAccounts(
+  connection: Connection,
+  mint: PublicKey,
+  tokenProgram: PublicKey,
+  source: PublicKey,
+  destination: PublicKey,
+  owner: PublicKey,
+  amount: bigint,
+): Promise<{ pubkey: PublicKey; isSigner: boolean; isWritable: boolean }[]> {
+  if (!tokenProgram.equals(TOKEN_2022_PROGRAM_ID)) return [];
+  const info = await connection.getAccountInfo(mint);
+  if (!info) return [];
+  const hook = getTransferHook(unpackMint(mint, info, TOKEN_2022_PROGRAM_ID));
+  if (!hook || hook.programId.equals(PublicKey.default)) return [];
+  // build a throwaway transfer_checked and let spl-token append what the hook wants
+  const ix = createTransferCheckedInstruction(source, mint, destination, owner, amount, 0, [], TOKEN_2022_PROGRAM_ID);
+  const before = ix.keys.length;
+  const withHook = await addExtraAccountMetasForExecute(connection, ix, hook.programId, source, mint, destination, owner, amount, 'confirmed');
+  const keys = (withHook ?? ix).keys.slice(before);
+  const seen = new Set<string>();
+  return keys.filter((k) => (seen.has(k.pubkey.toBase58()) ? false : (seen.add(k.pubkey.toBase58()), true))).map((k) => ({ pubkey: k.pubkey, isSigner: false, isWritable: k.isWritable }));
 }

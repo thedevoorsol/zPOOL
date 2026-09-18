@@ -2,13 +2,27 @@
  * High-level client: unlock, sync notes, deposit (wallet signs), withdraw / send (relayer signs).
  */
 import { TOKEN_2022_PROGRAM_ID, calculateEpochFee, getTransferFeeConfig, unpackMint, type TransferFeeConfig } from '@solana/spl-token';
-import { AddressLookupTableAccount, Connection, PublicKey, TransactionMessage, VersionedTransaction } from '@solana/web3.js';
+import { AddressLookupTableAccount, Connection, PublicKey, TransactionMessage, VersionedTransaction, type TransactionInstruction } from '@solana/web3.js';
+import {
+  AccountRole,
+  address as kitAddress,
+  appendTransactionMessageInstructions,
+  compileTransaction,
+  createTransactionMessage,
+  getTransactionEncoder,
+  pipe,
+  setTransactionMessageComputeUnitLimit,
+  setTransactionMessageFeePayer,
+  setTransactionMessageLifetimeUsingBlockhash,
+  setTransactionMessageLoadedAccountsDataSizeLimit,
+  type Instruction,
+} from '@solana/kit';
 import type { Program } from '@coral-xyz/anchor';
 import { FIELD_SIZE_BIG, bytesToHex, hexToBytes, poseidonReady } from './crypto';
 import { extDataHash, type ExtData } from './extdata';
 import { keyDerivationMessage, keysFromSignature, parseShieldedAddress, shieldedAddress, type ShieldKeys } from './keys';
 import { encryptNote, tryDecryptNote } from './notes';
-import { PROGRAM_ID, ata, computeBudgetIx, createPoolIx, getProgram, nullifierAccounts, transactSolIx, transactSplIx } from './program';
+import { PROGRAM_ID, ata, computeBudgetIx, createPoolIx, getProgram, hookAccounts, nullifierAccounts, transactSolIx, transactSplIx } from './program';
 import { fieldHashToDecimal, prove, publicAmountField, type Artifacts, type CircuitInput, type OnchainProof } from './prover';
 import { RelayerApi, type PoolInfo, type RelayerConfig } from './relayerApi';
 import { SOL_MINT, commitment, mintField, newUtxo, nullifier, type Utxo } from './utxo';
@@ -78,6 +92,25 @@ export class ShieldPool {
     const { blockhash } = await this.connection.getLatestBlockhash('confirmed');
     const msg = new TransactionMessage({ payerKey: payer, recentBlockhash: blockhash, instructions: [ix] }).compileToLegacyMessage();
     return new VersionedTransaction(msg);
+  }
+
+  /**
+   * The token account a wallet should deposit from: its associated account when that holds the most,
+   * otherwise the largest other account for the mint (DEX routers often leave coins in an auxiliary account).
+   */
+  async tokenAccountFor(owner: PublicKey, mint: PublicKey, tokenProgram: PublicKey): Promise<{ address: PublicKey; amount: bigint }> {
+    const assoc = ata(owner, mint, tokenProgram);
+    let best: { address: PublicKey; amount: bigint } = { address: assoc, amount: 0n };
+    try {
+      const res = await this.connection.getParsedTokenAccountsByOwner(owner, { mint }, 'confirmed');
+      for (const { pubkey, account } of res.value) {
+        const amount = BigInt(account.data.parsed?.info?.tokenAmount?.amount ?? '0');
+        if (amount > best.amount || (amount === best.amount && pubkey.equals(assoc))) best = { address: pubkey, amount };
+      }
+    } catch {
+      /* fall back to the associated account */
+    }
+    return best;
   }
 
   async tokenProgramOf(mint: PublicKey): Promise<PublicKey> {
@@ -311,17 +344,23 @@ export class ShieldPool {
   }
 
   // ---------- operations ----------
+  /** Largest wallet-signed transaction Solana accepts in the legacy / v0 format. */
+  static readonly MAX_V0_BYTES = 1232;
+
   /**
-   * Deposit: returns a transaction for the wallet to sign and send. Wallet pays gas.
-   * `amount` is what leaves the wallet. For a Token-2022 mint with a transfer fee the vault receives
-   * amount minus that fee, and that net figure is what the proof commits to (so shielding a full balance works).
-   * SPL deposits use the pool's lookup table (v0); SOL deposits are legacy.
+   * Instructions for a deposit. `walletAmount` is what leaves the wallet; for a Token-2022 mint with a transfer fee
+   * the vault receives amount minus that fee and that net figure is what the proof commits to (so shielding a full
+   * balance works). The source is whichever token account holds the coins, which also stands in as the
+   * recipient account (a deposit never pays anyone out), keeping the transaction one key smaller.
    */
-  async buildDepositTx(mint: PublicKey, walletAmount: bigint, signer: PublicKey, onProgress?: ProgressCb): Promise<VersionedTransaction> {
+  private async depositInstructions(mint: PublicKey, walletAmount: bigint, signer: PublicKey, onProgress?: ProgressCb, opts: { signerTokenAccount?: PublicKey } = {}): Promise<{ ixs: TransactionInstruction[]; alt: string | null }> {
     if (!this.keys) throw new Error('locked');
     const cfg = await this.config();
     const pool = await this.requirePool(mint);
     const feeRecipient = new PublicKey(cfg.feeRecipient);
+    const isSol = mint.equals(SOL_MINT);
+    const tokenProgram = isSol ? SOL_MINT : new PublicKey(pool.tokenProgram);
+    const source = isSol ? signer : opts.signerTokenAccount ?? (await this.tokenAccountFor(signer, mint, tokenProgram)).address;
     onProgress?.({ step: 'proving', detail: 'generating zero-knowledge proof' });
     const preview = await this.depositPreview(mint, walletAmount);
     const amount = preview.net;
@@ -330,8 +369,6 @@ export class ShieldPool {
     const out = newUtxo({ amount: amount - depositFee, pubkey: this.keys.utxoPubkey, privkey: this.keys.utxoPrivkey, mint });
     const change = newUtxo({ amount: 0n, pubkey: this.keys.utxoPubkey, privkey: this.keys.utxoPrivkey, mint });
     // the program hashes the TOKEN ACCOUNTS (not the wallets) for SPL pools
-    const isSol = mint.equals(SOL_MINT);
-    const tokenProgramPk = isSol ? SOL_MINT : new PublicKey(pool.tokenProgram);
     const { proof, enc1, enc2 } = await this.buildProof({
       mint,
       inputs: [],
@@ -339,16 +376,16 @@ export class ShieldPool {
       outputEncPubs: [this.keys.encPub, this.keys.encPub],
       extAmount: amount,
       fee: depositFee,
-      recipient: isSol ? signer : ata(signer, mint, tokenProgramPk),
-      feeRecipient: isSol ? feeRecipient : ata(feeRecipient, mint, tokenProgramPk),
+      recipient: source,
+      feeRecipient: isSol ? feeRecipient : ata(feeRecipient, mint, tokenProgram),
     });
     onProgress?.({ step: 'building', detail: 'assembling transaction' });
-    const ixs = [computeBudgetIx()];
-    let alt: AddressLookupTableAccount[] = [];
-    if (mint.equals(SOL_MINT)) {
+    const ixs: TransactionInstruction[] = [computeBudgetIx()];
+    if (isSol) {
       ixs.push(await transactSolIx(this.program, { proof, extAmount: amount, fee: depositFee, encryptedOutput1: enc1, encryptedOutput2: enc2, signer, recipient: signer, feeRecipient }));
     } else {
-      const tokenProgram = new PublicKey(pool.tokenProgram);
+      const vault = (await import('./program')).vaultAta(mint, tokenProgram, this.program.programId);
+      const remainingAccounts = await hookAccounts(this.connection, mint, tokenProgram, source, vault, signer, amount);
       ixs.push(
         await transactSplIx(this.program, {
           proof,
@@ -358,24 +395,76 @@ export class ShieldPool {
           encryptedOutput2: enc2,
           signer,
           recipient: signer,
+          recipientTokenAccount: source,
           feeRecipient,
           mint,
           tokenProgram,
-          signerTokenAccount: ata(signer, mint, tokenProgram),
+          signerTokenAccount: source,
+          remainingAccounts,
         }),
       );
     }
-    if (pool.alt) {
-      // a freshly extended lookup table becomes usable one slot later; retry briefly instead of failing
-      for (let i = 0; i < 6 && !alt.length; i++) {
-        const res = await this.connection.getAddressLookupTable(new PublicKey(pool.alt));
-        if (res.value && res.value.state.addresses.length > 0) alt = [res.value];
-        else await new Promise((r) => setTimeout(r, 1500));
-      }
+    return { ixs, alt: pool.alt };
+  }
+
+  private async loadAlt(alt: string | null): Promise<AddressLookupTableAccount[]> {
+    if (!alt) return [];
+    // a freshly extended lookup table becomes usable one slot later; retry briefly instead of failing
+    for (let i = 0; i < 6; i++) {
+      const res = await this.connection.getAddressLookupTable(new PublicKey(alt));
+      if (res.value && res.value.state.addresses.length > 0) return [res.value];
+      await new Promise((r) => setTimeout(r, 1500));
     }
+    return [];
+  }
+
+  /**
+   * Deposit as a v0 transaction (lookup table) for the wallet to sign and send. Wallet pays gas.
+   * Throws before asking the wallet when the result would not fit the 1,232-byte limit.
+   */
+  async buildDepositTx(mint: PublicKey, walletAmount: bigint, signer: PublicKey, onProgress?: ProgressCb, opts: { signerTokenAccount?: PublicKey } = {}): Promise<VersionedTransaction> {
+    const { ixs, alt } = await this.depositInstructions(mint, walletAmount, signer, onProgress, opts);
+    const tables = await this.loadAlt(alt);
     const { blockhash } = await this.connection.getLatestBlockhash('confirmed');
-    const msg = new TransactionMessage({ payerKey: signer, recentBlockhash: blockhash, instructions: ixs }).compileToV0Message(alt);
-    return new VersionedTransaction(msg);
+    const msg = new TransactionMessage({ payerKey: signer, recentBlockhash: blockhash, instructions: ixs }).compileToV0Message(tables);
+    const tx = new VersionedTransaction(msg);
+    const size = tx.serialize().length;
+    if (size > ShieldPool.MAX_V0_BYTES) {
+      throw new Error(`this deposit needs ${size} bytes, above the ${ShieldPool.MAX_V0_BYTES}-byte limit wallets can sign today (${tables.length ? 'lookup table in use' : 'lookup table unavailable'}). A wallet that signs transaction v1 lifts the limit to 4,096 bytes.`);
+    }
+    return tx;
+  }
+
+  /**
+   * Deposit as wire bytes for a wallet-standard `signAndSendTransaction`. `version: 1` builds the 4,096-byte
+   * format (no lookup table needed) for wallets that advertise it; 0 builds the v0 form and checks the size first.
+   */
+  async buildDepositBytes(mint: PublicKey, walletAmount: bigint, signer: PublicKey, onProgress?: ProgressCb, opts: { version?: 0 | 1; signerTokenAccount?: PublicKey } = {}): Promise<{ bytes: Uint8Array; version: 0 | 1; size: number }> {
+    if ((opts.version ?? 0) === 0) {
+      const tx = await this.buildDepositTx(mint, walletAmount, signer, onProgress, opts);
+      const bytes = tx.serialize();
+      return { bytes, version: 0, size: bytes.length };
+    }
+    const { ixs } = await this.depositInstructions(mint, walletAmount, signer, onProgress, opts);
+    const { value: bh } = await (await import('@solana/kit')).createSolanaRpc(this.connection.rpcEndpoint).getLatestBlockhash({ commitment: 'confirmed' }).send();
+    const toKit = (ix: TransactionInstruction): Instruction => ({
+      programAddress: kitAddress(ix.programId.toBase58()),
+      accounts: ix.keys.map((k) => ({
+        address: kitAddress(k.pubkey.toBase58()),
+        role: k.isSigner ? (k.isWritable ? AccountRole.WRITABLE_SIGNER : AccountRole.READONLY_SIGNER) : k.isWritable ? AccountRole.WRITABLE : AccountRole.READONLY,
+      })),
+      data: new Uint8Array(ix.data),
+    });
+    const msg = pipe(
+      createTransactionMessage({ version: 1 }),
+      (m) => setTransactionMessageFeePayer(kitAddress(signer.toBase58()), m),
+      (m) => setTransactionMessageLifetimeUsingBlockhash(bh, m),
+      (m) => appendTransactionMessageInstructions(ixs.slice(1).map(toKit), m), // compute budget lives in the v1 header
+      (m) => setTransactionMessageComputeUnitLimit(1_400_000, m),
+      (m) => setTransactionMessageLoadedAccountsDataSizeLimit(16_000_000, m),
+    );
+    const bytes = new Uint8Array(getTransactionEncoder().encode(compileTransaction(msg)));
+    return { bytes, version: 1, size: bytes.length };
   }
 
   /** Withdraw to any wallet. The relayer pays gas and pre-creates the token account. */

@@ -13,11 +13,25 @@ export type JupToken = { mint: string; symbol: string; name: string; decimals: n
 const searchCache = new Map<string, { at: number; value: JupToken[] }>();
 const SEARCH_TTL = 60_000;
 
+/** Strip characters that render as nothing (Hangul filler, zero-width, braille blank, BOM) so "blank" names are caught. */
+const INVISIBLE = /[\u3164\u115f\u1160\u200b-\u200f\u2028\u2029\u202f\u2060-\u206f\u2800\ufeff\u00a0]/g;
+export function visible(text: string | null | undefined): string {
+  return (text ?? '').replace(INVISIBLE, '').trim();
+}
+/** Symbol and name a human can read; falls back to the mint when the metadata is empty or invisible. */
+export function displayNames(symbol: string | null | undefined, name: string | null | undefined, mint: string): { symbol: string; name: string } {
+  const sym = visible(symbol);
+  const nm = visible(name);
+  return { symbol: sym || mint.slice(0, 4).toUpperCase(), name: nm || `Unnamed token ${mint.slice(0, 4)}…${mint.slice(-4)}` };
+}
+
 function norm(x: Record<string, unknown>): JupToken {
+  const mint = String(x.id);
+  const dn = displayNames(String(x.symbol ?? ''), String(x.name ?? ''), mint);
   return {
-    mint: String(x.id),
-    symbol: String(x.symbol ?? ''),
-    name: String(x.name ?? ''),
+    mint,
+    symbol: dn.symbol,
+    name: dn.name,
     decimals: Number(x.decimals ?? 0),
     logoUri: typeof x.icon === 'string' && x.icon ? x.icon : null,
     tokenProgram: typeof x.tokenProgram === 'string' ? x.tokenProgram : null,

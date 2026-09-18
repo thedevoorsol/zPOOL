@@ -49,11 +49,11 @@ import {
 } from '@solana/kit';
 import { poseidonReady } from '../../sdk/src/crypto';
 import { MerkleTree } from '../../sdk/src/merkle';
-import { IDL, PROGRAM_ID, ata, computeBudgetIx, fetchGlobalConfig, getProgram, nullifierAccounts, pdaGlobalConfig, pdaPoolTree, pdaSolTree, pdaTreeToken, transactSolIx, transactSplIx, vaultAta } from '../../sdk/src/program';
+import { IDL, PROGRAM_ID, ata, computeBudgetIx, fetchGlobalConfig, getProgram, hookAccounts, nullifierAccounts, pdaGlobalConfig, pdaPoolTree, pdaSolTree, pdaTreeToken, transactSolIx, transactSplIx, vaultAta } from '../../sdk/src/program';
 import type { OnchainProof } from '../../sdk/src/prover';
 import { SOL_MINT } from '../../sdk/src/utxo';
 import { Db, type PoolRow } from './db.ts';
-import { flatFeeInToken, imageFromUri, refreshPrices, searchTokens, tokensByMint, usdPrice } from './tokens.ts';
+import { displayNames, flatFeeInToken, imageFromUri, refreshPrices, searchTokens, tokensByMint, usdPrice } from './tokens.ts';
 
 const RPC_URL = process.env.RPC_URL ?? 'http://127.0.0.1:8899';
 const PORT = Number(process.env.PORT ?? 8787);
@@ -157,7 +157,8 @@ async function tokenMeta(mint: PublicKey, tokenProgram: PublicKey): Promise<{ sy
   } catch {
     /* metadata is optional */
   }
-  return { symbol, name, logoUri: await imageFromUri(logoUri), decimals: m.decimals };
+  const dn = displayNames(symbol, name, mint.toBase58());
+  return { symbol: dn.symbol, name: dn.name, logoUri: await imageFromUri(logoUri), decimals: m.decimals };
 }
 
 /** Pools registered before icons were resolved may hold a metadata JSON url or nothing: fix them once. */
@@ -253,11 +254,15 @@ async function provisionPool(mint: PublicKey): Promise<PoolRow> {
   if (!altAddr) {
     const slot = await connection.getSlot('finalized');
     const [createIx, address] = AddressLookupTableProgram.createLookupTable({ authority: relayer.publicKey, payer: relayer.publicKey, recentSlot: slot });
+    // transfer-hook mints: the hook program and its static extra accounts go in the table too, so wallet-signed
+    // deposits on such mints still fit in 1,232 bytes
+    const hookExtra = (await hookAccounts(connection, mint, tokenProgram, vault, feeAta, pdaGlobalConfig(), 1n).catch(() => [])).map((k) => k.pubkey);
+    const addresses = [PROGRAM_ID, pdaGlobalConfig(), mint, pdaPoolTree(mint), vault, feeAta, tokenProgram, ASSOCIATED_TOKEN_PROGRAM_ID, SystemProgram.programId, ComputeBudgetProgram.programId, ...hookExtra].filter((a, i, arr) => arr.findIndex((b) => b.equals(a)) === i).slice(0, 256);
     const extendIx = AddressLookupTableProgram.extendLookupTable({
       lookupTable: address,
       authority: relayer.publicKey,
       payer: relayer.publicKey,
-      addresses: [PROGRAM_ID, pdaGlobalConfig(), mint, pdaPoolTree(mint), vault, feeAta, tokenProgram, ASSOCIATED_TOKEN_PROGRAM_ID, SystemProgram.programId, ComputeBudgetProgram.programId],
+      addresses,
     });
     ixs.push(createIx, extendIx);
     altAddr = address;
@@ -278,6 +283,8 @@ async function provisionPool(mint: PublicKey): Promise<PoolRow> {
   };
   db.upsertPool(row);
   log('pool provisioned', meta.symbol, key, 'alt', row.alt);
+  // quote fees for the new pool right away instead of waiting for the next price cycle
+  refreshPrices([key]).catch((e) => log('price refresh failed', key, e.message));
   return row;
 }
 
@@ -506,6 +513,12 @@ async function relay(body: RelayBody): Promise<string> {
     const tokenProgram = new PublicKey(pool.token_program);
     const recipientAta = ata(recipient, mint, tokenProgram);
     if (body.kind === 'withdraw') ixs.push(createAssociatedTokenAccountIdempotentInstruction(relayer.publicKey, recipientAta, recipient, mint, tokenProgram));
+    // transfer hooks: extra accounts for vault -> recipient and vault -> fee account (union, deduped)
+    const vault = vaultAta(mint, tokenProgram);
+    const feeAta = ata(gc.feeRecipient, mint, tokenProgram);
+    const hookOut = body.kind === 'withdraw' ? await hookAccounts(connection, mint, tokenProgram, vault, recipientAta, pdaGlobalConfig(), amountAbs).catch(() => []) : [];
+    const hookFee = fee > 0n ? await hookAccounts(connection, mint, tokenProgram, vault, feeAta, pdaGlobalConfig(), fee).catch(() => []) : [];
+    const remainingAccounts = [...hookOut, ...hookFee].filter((k, i, arr) => arr.findIndex((x) => x.pubkey.equals(k.pubkey)) === i);
     ixs.push(
       await transactSplIx(program, {
         proof: body.proof,
@@ -520,6 +533,7 @@ async function relay(body: RelayBody): Promise<string> {
         tokenProgram,
         // the relayer never deposits, but the account must be a valid token account it owns
         signerTokenAccount: await relayerTokenAccount(mint, tokenProgram),
+        remainingAccounts,
       }),
     );
     if (pool.alt) alts = [await loadAlt(pool.alt)];
@@ -557,6 +571,7 @@ async function relayerTokenAccount(mint: PublicKey, tokenProgram: PublicKey): Pr
 // ---------------------------------------------------------------- http
 function poolJson(p: PoolRow) {
   const flat = flatFees(p);
+  const dn = displayNames(p.symbol, p.name, p.mint);
   return {
     sendFee: (flat.send ?? 0n).toString(),
     withdrawMinFee: (flat.withdraw ?? BigInt(p.min_fee)).toString(),
@@ -565,8 +580,8 @@ function poolJson(p: PoolRow) {
     mint: p.mint,
     tokenProgram: p.token_program,
     decimals: p.decimals,
-    symbol: p.symbol,
-    name: p.name,
+    symbol: dn.symbol,
+    name: dn.name,
     logoUri: p.logo_uri ?? undefined,
     tree: p.tree,
     vault: p.vault,
@@ -658,7 +673,11 @@ async function route(req: http.IncomingMessage, url: URL, res: http.ServerRespon
       return t ? { ...t, hasPool: !!db.pool(m) } : null;
     });
   }
-  if (req.method === 'GET' && p === '/pools') return db.pools().map(poolJson);
+  if (req.method === 'GET' && p === '/pools') {
+    const unpriced = db.pools().filter((x) => x.mint !== SOL_MINT.toBase58() && usdPrice(x.mint) === null).map((x) => x.mint);
+    if (unpriced.length) await refreshPrices(unpriced).catch(() => undefined);
+    return db.pools().map(poolJson);
+  }
   if (req.method === 'GET' && p.startsWith('/pools/')) {
     const row = db.pool(p.slice('/pools/'.length));
     return row ? poolJson(row) : null;
