@@ -40,6 +40,7 @@ import {
   getSignatureFromTransaction,
   pipe,
   setTransactionMessageComputeUnitLimit,
+  setTransactionMessageComputeUnitPrice,
   setTransactionMessageFeePayerSigner,
   setTransactionMessageLifetimeUsingBlockhash,
   setTransactionMessageLoadedAccountsDataSizeLimit,
@@ -335,26 +336,52 @@ function toKitIx(ix: TransactionInstruction): Instruction {
   };
 }
 
-/** Relayer-signed transaction in the v1 format: no lookup tables, 4,096 bytes, resource limits in the header. */
+/** Priority fee for relayed transactions (micro-lamports per CU); 500k CU × 3,000 = 0.0015 SOL worst case. */
+const PRIORITY_MICROLAMPORTS = BigInt(process.env.PRIORITY_MICROLAMPORTS ?? 3_000);
+const RELAY_CU_LIMIT = Number(process.env.RELAY_CU_LIMIT ?? 500_000);
+
+/**
+ * Relayer-signed transaction in the v1 format: no lookup tables, 4,096 bytes, resource limits in the header.
+ * Re-signs with a fresh blockhash and resends when the first attempt expires; fails loudly when the chain rejects it.
+ */
 async function sendV1(ixs: TransactionInstruction[]): Promise<string> {
   if (!kitSigner) kitSigner = await createKeyPairSignerFromBytes(relayer.secretKey);
   const signer = kitSigner;
-  const { value: bh } = await kitRpc.getLatestBlockhash({ commitment: 'confirmed' }).send();
-  const msg = pipe(
-    createTransactionMessage({ version: 1 }),
-    (m) => setTransactionMessageFeePayerSigner(signer, m),
-    (m) => setTransactionMessageLifetimeUsingBlockhash(bh, m),
-    (m) => appendTransactionMessageInstructions(ixs.map(toKitIx), m),
-    (m) => setTransactionMessageComputeUnitLimit(1_400_000, m),
-    (m) => setTransactionMessageLoadedAccountsDataSizeLimit(16_000_000, m),
-  );
-  const tx = await signTransactionMessageWithSigners(msg);
-  const sig = getSignatureFromTransaction(tx);
-  const wire = getBase64EncodedWireTransaction(tx);
-  await kitRpc.sendTransaction(wire, { encoding: 'base64', preflightCommitment: 'confirmed', maxRetries: 3n }).send();
-  await connection.confirmTransaction({ signature: sig, blockhash: bh.blockhash, lastValidBlockHeight: Number(bh.lastValidBlockHeight) }, 'confirmed');
-  log('v1 tx', sig, `${Math.ceil((wire.length * 3) / 4)} bytes`);
-  return sig;
+  let lastErr: Error | null = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const { value: bh } = await kitRpc.getLatestBlockhash({ commitment: 'confirmed' }).send();
+    const msg = pipe(
+      createTransactionMessage({ version: 1 }),
+      (m) => setTransactionMessageFeePayerSigner(signer, m),
+      (m) => setTransactionMessageLifetimeUsingBlockhash(bh, m),
+      (m) => appendTransactionMessageInstructions(ixs.map(toKitIx), m),
+      (m) => setTransactionMessageComputeUnitLimit(RELAY_CU_LIMIT, m),
+      (m) => setTransactionMessageLoadedAccountsDataSizeLimit(16_000_000, m),
+      // kit's typing does not cover version 1 for the price helper; it writes the same header field
+      (m) => setTransactionMessageComputeUnitPrice(PRIORITY_MICROLAMPORTS, m as never) as unknown as typeof m,
+    );
+    const tx = await signTransactionMessageWithSigners(msg);
+    const sig = getSignatureFromTransaction(tx);
+    const wire = getBase64EncodedWireTransaction(tx);
+    try {
+      await kitRpc.sendTransaction(wire, { encoding: 'base64', preflightCommitment: 'confirmed', maxRetries: 5n }).send();
+      // keep re-sending the same signed bytes until confirmed or the blockhash expires
+      const deadline = Number(bh.lastValidBlockHeight);
+      for (;;) {
+        const st = (await connection.getSignatureStatuses([sig])).value[0];
+        if (st?.err) throw new Error('transaction failed on chain: ' + JSON.stringify(st.err));
+        if (st && (st.confirmationStatus === 'confirmed' || st.confirmationStatus === 'finalized')) { log('v1 tx', sig, `${Math.ceil((wire.length * 3) / 4)} bytes`, attempt ? `(attempt ${attempt + 1})` : ''); return sig; }
+        if ((await connection.getBlockHeight('confirmed')) > deadline) throw Object.assign(new Error('expired'), { expired: true });
+        await kitRpc.sendTransaction(wire, { encoding: 'base64', skipPreflight: true, maxRetries: 0n }).send().catch(() => undefined);
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+    } catch (e) {
+      lastErr = e as Error;
+      if (!(e as { expired?: boolean }).expired) throw e; // real failure: do not retry (nullifiers may be spent)
+      log('v1 tx expired, retrying with a fresh blockhash');
+    }
+  }
+  throw lastErr ?? new Error('send failed');
 }
 
 async function loadAlt(addr: string): Promise<AddressLookupTableAccount> {
@@ -547,7 +574,8 @@ async function relay(body: RelayBody): Promise<string> {
     const tx = new VersionedTransaction(msg);
     tx.sign([relayer]);
     sig = await connection.sendTransaction(tx, { skipPreflight: false, maxRetries: 3 });
-    await connection.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, 'confirmed');
+    const r = await connection.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, 'confirmed');
+    if (r.value.err) throw new Error('transaction failed on chain: ' + JSON.stringify(r.value.err));
   }
   log(body.kind, pool.symbol, 'fee', fee.toString(), sig);
   // index right away so the client sees its change note

@@ -31,7 +31,8 @@ import { SOL_MINT, commitment, mintField, newUtxo, nullifier, type Utxo } from '
 export type Progress = { step: string; detail?: string; signature?: string };
 export type ProgressCb = (p: Progress) => void;
 
-export type OwnedNote = Utxo & { index: number; spent: boolean; nullifierHex: string; signature: string };
+export type OwnedNote = Utxo & { index: number; spent: boolean; nullifierHex: string; signature: string; /** set when WE marked it spent (reserved or just relayed); re-verified on the next syncs */ spentAt?: number };
+export type PreparedSend = { mint: PublicKey; amount: bigint; fee: bigint; inputs: OwnedNote[]; createdAt: number; request: import('./relayerApi.js').RelayRequest };
 
 /** Hosted defaults: the public relayer and the circuit files served from zpool.fun (immutable, CDN cached). */
 export const DEFAULT_RELAYER_URL = 'https://zpool-relayer-production.up.railway.app';
@@ -52,6 +53,10 @@ export class ShieldPool {
   readonly artifacts: Artifacts;
   keys: ShieldKeys | null = null;
   private notes = new Map<string, OwnedNote[]>();
+  /** nullifiers of notes currently reserved by an in-flight proof (never re-marked unspent by sync) */
+  private reserved = new Set<string>();
+  private reserve(notes: OwnedNote[]): void { for (const n of notes) { n.spent = true; n.spentAt = Date.now(); this.reserved.add(n.nullifierHex); } }
+  private release(notes: OwnedNote[], spentForReal: boolean): void { for (const n of notes) { this.reserved.delete(n.nullifierHex); if (spentForReal) { n.spent = true; n.spentAt = Date.now(); } else { n.spent = false; n.spentAt = undefined; } } }
   private scanned = new Map<string, number>();
   private cfg: RelayerConfig | null = null;
   private transferFees = new Map<string, { at: number; cfg: TransferFeeConfig | null; epoch: bigint }>();
@@ -159,11 +164,12 @@ export class ShieldPool {
       if (page.utxos.length === 0) break;
     }
     this.scanned.set(key, start);
-    const unspentCandidates = mine.filter((n) => !n.spent);
+    // re-check notes we marked spent ourselves in the last 3 minutes: a dropped or failed relay must not hide funds
+    const unspentCandidates = mine.filter((n) => !n.spent || (n.spentAt && Date.now() - n.spentAt < 180_000 && !this.reserved.has(n.nullifierHex)));
     if (unspentCandidates.length) {
       const hexes = unspentCandidates.map((n) => n.nullifierHex);
       const spent = this.spentChecker ? await this.spentChecker(hexes) : (await this.relayer.nullifiers(hexes)).spent;
-      unspentCandidates.forEach((n, i) => (n.spent = spent[i]));
+      unspentCandidates.forEach((n, i) => { if (spent[i]) { n.spent = true; n.spentAt = undefined; } else if (!n.spentAt || Date.now() - n.spentAt > 45_000) n.spent = false; });
     }
     this.notes.set(key, mine);
     return mine;
@@ -525,6 +531,8 @@ export class ShieldPool {
     const fee = await this.withdrawFee(mint, amount);
     await this.sync(mint);
     const inputs = await this.selectInputsMerging(mint, amount + fee, onProgress);
+    this.reserve(inputs);
+    try {
     const inSum = inputs.reduce((s, n) => s + n.amount, 0n);
     const change = newUtxo({ amount: inSum - amount - fee, pubkey: this.keys.utxoPubkey, privkey: this.keys.utxoPrivkey, mint });
     const dummy = newUtxo({ amount: 0n, pubkey: this.keys.utxoPubkey, privkey: this.keys.utxoPrivkey, mint });
@@ -550,9 +558,11 @@ export class ShieldPool {
       encryptedOutput1: Buffer.from(enc1).toString('base64'),
       encryptedOutput2: Buffer.from(enc2).toString('base64'),
     });
-    inputs.forEach((n) => (n.spent = true));
+    await this.assertLanded(signature);
+    this.release(inputs, true);
     onProgress?.({ step: 'confirmed', signature });
     return signature;
+    } catch (e) { this.release(inputs, false); throw e; }
   }
 
   /** In-pool payment to a shielded address. Amount, sender and receiver stay hidden. */
@@ -563,6 +573,8 @@ export class ShieldPool {
     const fee = await this.sendFee(mint, amount);
     await this.sync(mint);
     const inputs = await this.selectInputsMerging(mint, amount + fee, onProgress);
+    this.reserve(inputs);
+    try {
     const inSum = inputs.reduce((s, n) => s + n.amount, 0n);
     const pay = newUtxo({ amount, pubkey: to.utxoPubkey, mint });
     const change = newUtxo({ amount: inSum - amount - fee, pubkey: this.keys.utxoPubkey, privkey: this.keys.utxoPrivkey, mint });
@@ -591,9 +603,122 @@ export class ShieldPool {
       encryptedOutput1: Buffer.from(enc1).toString('base64'),
       encryptedOutput2: Buffer.from(enc2).toString('base64'),
     });
-    inputs.forEach((n) => (n.spent = true));
+    await this.assertLanded(signature);
+    this.release(inputs, true);
     onProgress?.({ step: 'confirmed', signature });
     return signature;
+    } catch (e) { this.release(inputs, false); throw e; }
+  }
+
+  /** A private payment proven ahead of time; submit it with submitPrepared(). Inputs are reserved until then. */
+  async prepareSend(mint: PublicKey, amount: bigint, toShielded: string, onProgress?: ProgressCb): Promise<PreparedSend> {
+    if (!this.keys) throw new Error('locked');
+    const cfg = await this.config();
+    const to = parseShieldedAddress(toShielded);
+    const fee = await this.sendFee(mint, amount);
+    await this.sync(mint);
+    const inputs = await this.selectInputsMerging(mint, amount + fee, onProgress);
+    this.reserve(inputs); // from here nobody else can pick these notes
+    let built: Awaited<ReturnType<ShieldPool['buildProof']>>;
+    try {
+      const inSum = inputs.reduce((s, n) => s + n.amount, 0n);
+      const pay = newUtxo({ amount, pubkey: to.utxoPubkey, mint });
+      const change = newUtxo({ amount: inSum - amount - fee, pubkey: this.keys.utxoPubkey, privkey: this.keys.utxoPrivkey, mint });
+      const pool = await this.requirePool(mint);
+      const feeRecipient = mint.equals(SOL_MINT) ? new PublicKey(cfg.feeRecipient) : ata(new PublicKey(cfg.feeRecipient), mint, new PublicKey(pool.tokenProgram));
+      onProgress?.({ step: 'proving', detail: 'generating zero-knowledge proof' });
+      built = await this.buildProof({
+        mint, inputs, outputs: [pay, change], outputEncPubs: [to.encPub, this.keys.encPub], extAmount: 0n, fee,
+        recipient: mint.equals(SOL_MINT) ? new PublicKey(cfg.relayer) : ata(new PublicKey(cfg.feeRecipient), mint, new PublicKey(pool.tokenProgram)),
+        feeRecipient,
+      });
+    } catch (e) { this.release(inputs, false); throw e; }
+    const { proof, enc1, enc2 } = built;
+    return {
+      mint, amount, fee, inputs, createdAt: Date.now(),
+      request: { kind: 'send', mint: mint.toBase58(), proof, extAmount: '0', fee: fee.toString(), recipient: mint.equals(SOL_MINT) ? cfg.relayer : cfg.feeRecipient, encryptedOutput1: Buffer.from(enc1).toString('base64'), encryptedOutput2: Buffer.from(enc2).toString('base64') },
+    };
+  }
+  async submitPrepared(p: PreparedSend, onProgress?: ProgressCb): Promise<string> {
+    onProgress?.({ step: 'relaying', detail: 'relayer is submitting' });
+    try {
+      const { signature } = await this.relayer.relay(p.request);
+      await this.assertLanded(signature);
+      this.release(p.inputs, true);
+      onProgress?.({ step: 'confirmed', signature });
+      return signature;
+    } catch (e) {
+      this.release(p.inputs, false);
+      throw e;
+    }
+  }
+  /** Drop a prepared payment without sending it (releases its inputs). */
+  cancelPrepared(p: PreparedSend): void { this.release(p.inputs, false); }
+  /** The relayer confirms before answering; still verify the transaction did not fail on chain. */
+  private async assertLanded(signature: string): Promise<void> {
+    for (let i = 0; i < 20; i++) {
+      const st = (await this.connection.getSignatureStatuses([signature])).value[0];
+      if (st?.err) throw new Error('transaction failed on chain: ' + JSON.stringify(st.err));
+      if (st && (st.confirmationStatus === 'confirmed' || st.confirmationStatus === 'finalized')) return;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+
+  /**
+   * Deposit into someone else's shielded balance: the first note goes to `toShielded`, the optional second note
+   * (surplus) to our own keys. Used by services that deliver tokens privately. The signer pays and signs.
+   */
+  /** Smallest wallet amount whose credited deposit (after token and protocol fees) is at least `credited`. */
+  async grossForCredited(mint: PublicKey, credited: bigint): Promise<bigint> {
+    let guess = credited;
+    for (let i = 0; i < 8; i++) {
+      const p = await this.depositPreview(mint, guess);
+      if (p.credited >= credited) { // tighten down while it still fits
+        let lo = credited, hi = guess;
+        while (hi - lo > 1n) { const mid = (lo + hi) / 2n; if ((await this.depositPreview(mint, mid)).credited >= credited) hi = mid; else lo = mid; }
+        return hi;
+      }
+      guess = (guess * (credited + 1n)) / (p.credited > 0n ? p.credited : 1n) + 1n;
+    }
+    throw new Error('could not size the deposit');
+  }
+
+  /** Proof + instructions for a deposit into someone else's balance; compile later with a fresh blockhash. */
+  async buildDepositIxsFor(mint: PublicKey, walletAmount: bigint, signer: PublicKey, toShielded: string, toAmount: bigint, opts: { signerTokenAccount?: PublicKey } = {}): Promise<{ ixs: TransactionInstruction[]; alt: string | null; walletAmount: bigint }> {
+    if (!this.keys) throw new Error('locked');
+    const cfg = await this.config();
+    const pool = await this.requirePool(mint);
+    const feeRecipient = new PublicKey(cfg.feeRecipient);
+    const isSol = mint.equals(SOL_MINT);
+    const tokenProgram = isSol ? SOL_MINT : new PublicKey(pool.tokenProgram);
+    const source = isSol ? signer : opts.signerTokenAccount ?? (await this.tokenAccountFor(signer, mint, tokenProgram)).address;
+    const preview = await this.depositPreview(mint, walletAmount);
+    const amount = preview.net; const depositFee = preview.protocolFee;
+    const credited = amount - depositFee;
+    if (toAmount > credited) throw new Error('recipient amount exceeds the credited deposit');
+    const to = parseShieldedAddress(toShielded);
+    const out = newUtxo({ amount: toAmount, pubkey: to.utxoPubkey, mint });
+    const surplus = newUtxo({ amount: credited - toAmount, pubkey: this.keys.utxoPubkey, privkey: this.keys.utxoPrivkey, mint });
+    const { proof, enc1, enc2 } = await this.buildProof({
+      mint, inputs: [], outputs: [out, surplus], outputEncPubs: [to.encPub, this.keys.encPub], extAmount: amount, fee: depositFee,
+      recipient: source, feeRecipient: isSol ? feeRecipient : ata(feeRecipient, mint, tokenProgram), emptySecond: credited - toAmount === 0n,
+    });
+    const ixs: TransactionInstruction[] = [computeBudgetIx()];
+    if (isSol) ixs.push(await transactSolIx(this.program, { proof, extAmount: amount, fee: depositFee, encryptedOutput1: enc1, encryptedOutput2: enc2, signer, recipient: signer, feeRecipient }));
+    else {
+      const vault = vaultAta(mint, tokenProgram, this.program.programId);
+      const remainingAccounts = await hookAccounts(this.connection, mint, tokenProgram, source, vault, signer, amount);
+      ixs.push(await transactSplIx(this.program, { proof, extAmount: amount, fee: depositFee, encryptedOutput1: enc1, encryptedOutput2: enc2, signer, recipient: signer, recipientTokenAccount: source, feeRecipient, mint, tokenProgram, signerTokenAccount: source, remainingAccounts }));
+    }
+    return { ixs, alt: pool.alt, walletAmount };
+  }
+  async compileDeposit(built: { ixs: TransactionInstruction[]; alt: string | null }, signer: PublicKey): Promise<VersionedTransaction> {
+    const tables = await this.loadAlt(built.alt);
+    const { blockhash } = await this.connection.getLatestBlockhash('confirmed');
+    return new VersionedTransaction(new TransactionMessage({ payerKey: signer, recentBlockhash: blockhash, instructions: built.ixs }).compileToV0Message(tables));
+  }
+  async buildDepositTxFor(mint: PublicKey, walletAmount: bigint, signer: PublicKey, toShielded: string, toAmount: bigint, opts: { signerTokenAccount?: PublicKey } = {}): Promise<VersionedTransaction> {
+    return this.compileDeposit(await this.buildDepositIxsFor(mint, walletAmount, signer, toShielded, toAmount, opts), signer);
   }
 
   /** Merge the two largest notes into one (a send to self). */

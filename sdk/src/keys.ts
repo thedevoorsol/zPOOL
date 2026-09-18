@@ -52,3 +52,8 @@ export function isShieldedAddress(addr: string): boolean {
     return false;
   }
 }
+
+/** Server-side unlock: derive the shielded keys of a Keypair by signing the same fixed message (ed25519). */
+export function keysFromKeypair(secretKey: Uint8Array, wallet: string, sign: (msg: Uint8Array, secretKey: Uint8Array) => Uint8Array): ShieldKeys {
+  return keysFromSignature(wallet, sign(keyDerivationMessage(wallet), secretKey));
+}
