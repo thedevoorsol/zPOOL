@@ -36,10 +36,40 @@ function be(x: string): number[] {
   return Array.from(bigToBytes32BE(BigInt(x)));
 }
 
-export async function prove(input: CircuitInput, artifacts: Artifacts): Promise<OnchainProof> {
+/** Raw snarkjs call; used on the main thread and inside the worker. */
+export async function fullProve(input: CircuitInput, artifacts: Artifacts): Promise<{ proof: unknown; publicSignals: string[] }> {
   const wasm = typeof artifacts.wasm === 'string' ? artifacts.wasm : { type: 'mem', data: artifacts.wasm };
   const zkey = typeof artifacts.zkey === 'string' ? artifacts.zkey : { type: 'mem', data: artifacts.zkey };
-  const { proof, publicSignals } = await groth16.fullProve(input as never, wasm as never, zkey as never);
+  const r = await groth16.fullProve(input as never, wasm as never, zkey as never);
+  return { proof: r.proof, publicSignals: r.publicSignals as string[] };
+}
+
+/** Proving takes a few seconds of CPU. In browsers it runs in a Web Worker so the UI never freezes; set to false to force the main thread. */
+export let useWorker = true;
+export function setUseWorker(v: boolean): void { useWorker = v; }
+let workerFailed = false;
+
+function proveInWorker(input: CircuitInput, artifacts: Artifacts): Promise<{ proof: unknown; publicSignals: string[] }> {
+  return new Promise((resolve, reject) => {
+    let w: Worker;
+    try {
+      w = new Worker(new URL('./prover.worker.js', import.meta.url), { type: 'module' });
+    } catch (e) { reject(e); return; }
+    const done = (fn: () => void) => { w.terminate(); fn(); };
+    w.onmessage = (ev: MessageEvent<{ ok: boolean; result?: { proof: unknown; publicSignals: string[] }; error?: string }>) => done(() => (ev.data.ok && ev.data.result ? resolve(ev.data.result) : reject(new Error(ev.data.error ?? 'proof failed'))));
+    w.onerror = (ev) => done(() => reject(new Error(ev.message || 'worker error')));
+    // string artifacts are URLs: make them absolute for the worker
+    const abs = (a: string | Uint8Array) => (typeof a === 'string' && typeof location !== 'undefined' ? new URL(a, location.href).toString() : a);
+    w.postMessage({ input, artifacts: { wasm: abs(artifacts.wasm), zkey: abs(artifacts.zkey) } });
+  });
+}
+
+export async function prove(input: CircuitInput, artifacts: Artifacts): Promise<OnchainProof> {
+  let r: { proof: unknown; publicSignals: string[] };
+  if (useWorker && !workerFailed && typeof Worker !== 'undefined' && typeof window !== 'undefined') {
+    try { r = await proveInWorker(input, artifacts); } catch { workerFailed = true; r = await fullProve(input, artifacts); }
+  } else r = await fullProve(input, artifacts);
+  const { proof, publicSignals } = r as { proof: { pi_a: string[]; pi_b: string[][]; pi_c: string[] }; publicSignals: string[] };
   const a = proof.pi_a as string[];
   const b = proof.pi_b as string[][];
   const c = proof.pi_c as string[];

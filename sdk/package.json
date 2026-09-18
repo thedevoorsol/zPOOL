@@ -1,13 +1,40 @@
 {
-  "name": "@shieldpool/sdk",
+  "name": "@zpool/sdk",
   "version": "0.1.0",
-  "private": true,
-  "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
-  "scripts": {
-    "typecheck": "tsc --noEmit"
+  "description": "zPOOL: shielded pool for any Solana token. Shield, pay privately, unshield, with proofs in the browser and a relayer paying gas.",
+  "license": "BUSL-1.1",
+  "homepage": "https://www.zpool.fun/docs",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/thedevoorsol/zPOOL"
   },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "solana",
+    "privacy",
+    "zk",
+    "shielded",
+    "zpool",
+    "token-2022"
+  ],
   "dependencies": {
     "@coral-xyz/anchor": "^0.31.1",
     "@lightprotocol/hasher.rs": "^0.2.1",

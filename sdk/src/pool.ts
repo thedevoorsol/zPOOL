@@ -2,7 +2,7 @@
  * High-level client: unlock, sync notes, deposit (wallet signs), withdraw / send (relayer signs).
  */
 import { TOKEN_2022_PROGRAM_ID, calculateEpochFee, getTransferFeeConfig, unpackMint, type TransferFeeConfig } from '@solana/spl-token';
-import { AddressLookupTableAccount, Connection, PublicKey, TransactionMessage, VersionedTransaction, type TransactionInstruction } from '@solana/web3.js';
+import { AddressLookupTableAccount, Connection, PublicKey, SystemProgram, TransactionMessage, VersionedTransaction, type TransactionInstruction } from '@solana/web3.js';
 import {
   AccountRole,
   address as kitAddress,
@@ -30,7 +30,19 @@ import { SOL_MINT, commitment, mintField, newUtxo, nullifier, type Utxo } from '
 export type Progress = { step: string; detail?: string; signature?: string };
 export type ProgressCb = (p: Progress) => void;
 
-export type OwnedNote = Utxo & { index: number; spent: boolean; nullifierHex: string };
+export type OwnedNote = Utxo & { index: number; spent: boolean; nullifierHex: string; signature: string };
+
+/** Hosted defaults: the public relayer and the circuit files served from zpool.fun (immutable, CDN cached). */
+export const DEFAULT_RELAYER_URL = 'https://zpool-relayer-production.up.railway.app';
+export const DEFAULT_ARTIFACTS: Artifacts = { wasm: 'https://www.zpool.fun/circuits/transaction2.wasm', zkey: 'https://www.zpool.fun/circuits/transaction2.zkey' };
+
+/**
+ * Integrator fee, charged on top of the protocol fee, on shields only (the only wallet-signed step).
+ * `bps` of the shielded amount goes to `address` (a wallet for SOL pools, the wallet whose token account receives
+ * it for SPL pools; that token account must already exist). Adds one instruction, about 50 bytes, to the deposit.
+ */
+export type PartnerFee = { address: PublicKey; bps: number };
+export function partnerFeeAmount(amount: bigint, fee: PartnerFee): bigint { return (amount * BigInt(fee.bps)) / 10000n; }
 
 export class ShieldPool {
   readonly connection: Connection;
@@ -42,6 +54,9 @@ export class ShieldPool {
   private scanned = new Map<string, number>();
   private cfg: RelayerConfig | null = null;
   private transferFees = new Map<string, { at: number; cfg: TransferFeeConfig | null; epoch: bigint }>();
+
+  /** Optional local spent check: given nullifier hexes, return spent flags without asking any server about them. */
+  spentChecker: ((hexes: string[]) => Promise<boolean[]>) | null = null;
 
   constructor(opts: { connection: Connection; relayerUrl: string; artifacts: Artifacts; programId?: PublicKey }) {
     this.connection = opts.connection;
@@ -137,7 +152,7 @@ export class ShieldPool {
         if (bytesToHex(hexToBytes(row.commitment)) !== bytesToHex(bigToBytes(commitment(u)))) continue; // not ours after all
         if (u.amount === 0n) continue;
         const n = nullifier(u);
-        mine.push({ ...u, index: row.index, spent: false, nullifierHex: bytesToHex(bigToBytes(n)) });
+        mine.push({ ...u, index: row.index, spent: false, nullifierHex: bytesToHex(bigToBytes(n)), signature: row.signature });
       }
       start = page.nextIndex;
       if (page.utxos.length === 0) break;
@@ -145,7 +160,8 @@ export class ShieldPool {
     this.scanned.set(key, start);
     const unspentCandidates = mine.filter((n) => !n.spent);
     if (unspentCandidates.length) {
-      const { spent } = await this.relayer.nullifiers(unspentCandidates.map((n) => n.nullifierHex));
+      const hexes = unspentCandidates.map((n) => n.nullifierHex);
+      const spent = this.spentChecker ? await this.spentChecker(hexes) : (await this.relayer.nullifiers(hexes)).spent;
       unspentCandidates.forEach((n, i) => (n.spent = spent[i]));
     }
     this.notes.set(key, mine);
@@ -154,6 +170,10 @@ export class ShieldPool {
 
   balance(mint: PublicKey): bigint {
     return (this.notes.get(mint.toBase58()) ?? []).filter((n) => !n.spent).reduce((s, n) => s + n.amount, 0n);
+  }
+  /** every note the keys own in a pool, spent or not */
+  allNotes(mint: PublicKey): OwnedNote[] {
+    return this.notes.get(mint.toBase58()) ?? [];
   }
   unspent(mint: PublicKey): OwnedNote[] {
     return (this.notes.get(mint.toBase58()) ?? []).filter((n) => !n.spent).sort((a, b) => (a.amount > b.amount ? -1 : 1));
@@ -360,7 +380,7 @@ export class ShieldPool {
    * balance works). The source is whichever token account holds the coins, which also stands in as the
    * recipient account (a deposit never pays anyone out), keeping the transaction one key smaller.
    */
-  private async depositInstructions(mint: PublicKey, walletAmount: bigint, signer: PublicKey, onProgress?: ProgressCb, opts: { signerTokenAccount?: PublicKey } = {}): Promise<{ ixs: TransactionInstruction[]; alt: string | null }> {
+  private async depositInstructions(mint: PublicKey, walletAmount: bigint, signer: PublicKey, onProgress?: ProgressCb, opts: { signerTokenAccount?: PublicKey; partner?: PartnerFee } = {}): Promise<{ ixs: TransactionInstruction[]; alt: string | null }> {
     if (!this.keys) throw new Error('locked');
     const cfg = await this.config();
     const pool = await this.requirePool(mint);
@@ -414,7 +434,28 @@ export class ShieldPool {
         }),
       );
     }
+    if (opts.partner && opts.partner.bps > 0) {
+      if (opts.partner.bps > 1000) throw new Error('partner fee above 10% is not allowed');
+      const cut = partnerFeeAmount(walletAmount, opts.partner);
+      if (cut > 0n) {
+        if (isSol) ixs.push(SystemProgram.transfer({ fromPubkey: signer, toPubkey: opts.partner.address, lamports: cut }));
+        else {
+          const { createTransferCheckedInstruction } = await import('@solana/spl-token');
+          const decimals = (await this.tokenDecimals(mint)) ?? 0;
+          ixs.push(createTransferCheckedInstruction(source, mint, ata(opts.partner.address, mint, tokenProgram), signer, cut, decimals, [], tokenProgram));
+        }
+      }
+    }
     return { ixs, alt: pool.alt };
+  }
+
+  private decimalsCache = new Map<string, number>();
+  async tokenDecimals(mint: PublicKey): Promise<number | null> {
+    const k = mint.toBase58();
+    if (this.decimalsCache.has(k)) return this.decimalsCache.get(k)!;
+    const p = await this.pool(mint);
+    if (p) { this.decimalsCache.set(k, p.decimals); return p.decimals; }
+    return null;
   }
 
   private async loadAlt(alt: string | null): Promise<AddressLookupTableAccount[]> {
@@ -432,7 +473,7 @@ export class ShieldPool {
    * Deposit as a v0 transaction (lookup table) for the wallet to sign and send. Wallet pays gas.
    * Throws before asking the wallet when the result would not fit the 1,232-byte limit.
    */
-  async buildDepositTx(mint: PublicKey, walletAmount: bigint, signer: PublicKey, onProgress?: ProgressCb, opts: { signerTokenAccount?: PublicKey } = {}): Promise<VersionedTransaction> {
+  async buildDepositTx(mint: PublicKey, walletAmount: bigint, signer: PublicKey, onProgress?: ProgressCb, opts: { signerTokenAccount?: PublicKey; partner?: PartnerFee } = {}): Promise<VersionedTransaction> {
     const { ixs, alt } = await this.depositInstructions(mint, walletAmount, signer, onProgress, opts);
     const tables = await this.loadAlt(alt);
     const { blockhash } = await this.connection.getLatestBlockhash('confirmed');
@@ -449,7 +490,7 @@ export class ShieldPool {
    * Deposit as wire bytes for a wallet-standard `signAndSendTransaction`. `version: 1` builds the 4,096-byte
    * format (no lookup table needed) for wallets that advertise it; 0 builds the v0 form and checks the size first.
    */
-  async buildDepositBytes(mint: PublicKey, walletAmount: bigint, signer: PublicKey, onProgress?: ProgressCb, opts: { version?: 0 | 1; signerTokenAccount?: PublicKey } = {}): Promise<{ bytes: Uint8Array; version: 0 | 1; size: number }> {
+  async buildDepositBytes(mint: PublicKey, walletAmount: bigint, signer: PublicKey, onProgress?: ProgressCb, opts: { version?: 0 | 1; signerTokenAccount?: PublicKey; partner?: PartnerFee } = {}): Promise<{ bytes: Uint8Array; version: 0 | 1; size: number }> {
     if ((opts.version ?? 0) === 0) {
       const tx = await this.buildDepositTx(mint, walletAmount, signer, onProgress, opts);
       const bytes = tx.serialize();
@@ -581,3 +622,12 @@ function bigToBytes(x: string | bigint): Uint8Array {
 }
 
 export { TOKEN_2022_PROGRAM_ID };
+
+/**
+ * One-call setup with the hosted relayer and circuit files. Pass your own RPC URL (a public one is rate limited).
+ * `partner` is optional: your fee on shields, on top of the protocol fee.
+ */
+export async function createZpool(opts: { rpcUrl: string; relayerUrl?: string; artifacts?: Artifacts; partner?: PartnerFee }): Promise<ShieldPool & { partner?: PartnerFee }> {
+  const pool = await ShieldPool.init({ connection: new Connection(opts.rpcUrl, 'confirmed'), relayerUrl: opts.relayerUrl ?? DEFAULT_RELAYER_URL, artifacts: opts.artifacts ?? DEFAULT_ARTIFACTS });
+  return Object.assign(pool, { partner: opts.partner });
+}

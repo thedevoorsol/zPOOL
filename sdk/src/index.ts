@@ -8,3 +8,4 @@ export * from './prover';
 export * from './program';
 export * from './relayerApi';
 export * from './pool';
+export * from './idl';
