@@ -1,13 +1,13 @@
-# @zpool/sdk
+# zpool-sdk
 
 Shielded pool for any Solana token. Shield coins into a private note, pay other shielded addresses with nothing on chain, unshield to any wallet with the relayer paying gas. Proofs are generated in the browser (in a Web Worker) or in Node.
 
 ```bash
-npm install @zpool/sdk
+npm install zpool-sdk
 ```
 
 ```ts
-import { createZpool, SOL_MINT } from '@zpool/sdk';
+import { createZpool, SOL_MINT } from 'zpool-sdk';
 import { PublicKey } from '@solana/web3.js';
 
 const pool = await createZpool({
