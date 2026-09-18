@@ -238,10 +238,15 @@ export class ShieldPool {
     let fee = kind === 'send' ? await this.sendFee(mint) : 0n;
     let max = top - fee;
     if (kind === 'withdraw') {
-      // the withdrawal fee depends on the amount: iterate to a fixed point
-      for (let i = 0; i < 4 && max > 0n; i++) {
+      // the withdrawal fee depends on the amount: iterate to a fixed point, then prove max + fee(max) fits
+      for (let i = 0; i < 6 && max > 0n; i++) {
         fee = await this.withdrawFee(mint, max);
         max = top - fee;
+      }
+      for (let i = 0; i < 1000 && max > 0n; i++) {
+        fee = await this.withdrawFee(mint, max);
+        if (max + fee <= top) break;
+        max -= 1n;
       }
     }
     if (max < 0n) max = 0n;
